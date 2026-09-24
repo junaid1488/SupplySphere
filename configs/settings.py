@@ -19,6 +19,11 @@ class Settings:
     processed_data_dir: Path = Path(os.getenv("PROCESSED_DATA_DIR", "data/processed"))
     model_dir: Path = Path(os.getenv("MODEL_DIR", "ml/models"))
     synthetic_seed: int = int(os.getenv("SYNTHETIC_SEED", "42"))
+    cors_origins: tuple[str, ...] = tuple(
+        origin.strip()
+        for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+        if origin.strip()
+    )
 
     @property
     def forecast_horizons(self) -> tuple[int, ...]:

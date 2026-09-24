@@ -5,7 +5,7 @@ from api.routes import dashboard, operations, geospatial, tracking, realtime, ml
 from dataset_analyzer import router as dataset_analyzer_router
 
 app = FastAPI(title='SupplySphere API', version='1.2.0', description='Supply-chain control tower APIs for phases 0-17')
-app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins), allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 app.include_router(dashboard.router)
 app.include_router(operations.router)
 app.include_router(geospatial.router)

@@ -1,0 +1,30 @@
+# Minimal FastAPI service for Render.
+# Backend only — no Redis, no PostgreSQL (API runtime does not use the database).
+services:
+  - type: web
+    name: supplysphere-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt && python scripts/bootstrap_runtime_artifact.py
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      # OR-Tools/README: project targets Python 3.11+ (3.14 known to stall).
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # src/dataset_analyzer is imported as top-level "dataset_analyzer".
+      - key: PYTHONPATH
+        value: ".:src"
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      # Set in Render dashboard after the Vercel domain is known (comma-separated).
+      - key: CORS_ORIGINS
+        sync: false
+      # External runtime artifact (data/raw + data/processed + models).
+      # Published GitHub Release asset — deployment config only, never in Git.
+      - key: SUPPLYSPHERE_RUNTIME_ARTIFACT_URL
+        value: https://github.com/junaid1488/SupplySphere/releases/download/deploy-runtime-v1/supplysphere-runtime.tar.gz
+      # Integrity check for the runtime artifact.
+      - key: SUPPLYSPHERE_RUNTIME_ARTIFACT_SHA256
+        value: f3c366ad21e290e1c0568811c23f70fdc4976e6df9cb77efd1a5e1873a78e36f

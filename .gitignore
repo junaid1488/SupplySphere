@@ -13,6 +13,9 @@ ml/artifacts/*
 *.log
 # Kaggle archives / raw source artifacts
 *.zip
+# Deployment runtime payload (host externally; never commit)
+*.tar.gz
+*.tgz
 node_modules/
 dist/
 *.err
