@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.env
+data/raw/*
+data/staging/*
+data/processed/*
+ml/models/*
+ml/artifacts/*
+!data/raw/.gitkeep
+!ml/models/.gitkeep
+*.log
+# Kaggle archives / raw source artifacts
+*.zip
+node_modules/
+dist/
+*.err
+*.egg-info/
+data/models/
