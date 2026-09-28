@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://supplysphere-api.onrender.com/api/:path*"
+    }
+  ]
+}
