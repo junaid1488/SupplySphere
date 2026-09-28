@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 import json
+import threading
 import pandas as pd
 from configs.settings import settings
 
@@ -15,6 +16,15 @@ _STOCKOUT_DTYPES = {
     'expected_stockout_date': 'category',
 }
 _INVENTORY_DTYPES = {'warehouse_id': 'category', 'product_id': 'category'}
+
+# stockout_predictions.csv is a multi-million-row frame; re-reading it for
+# every request re-parses the file and briefly doubles peak RSS on the 512 MiB
+# Render instance. One frame is loaded per process (keyed by data root, so a
+# different root still reads its own file) and shared by every caller. All
+# consumers only take masks/slices/copies from it, so returning the same object
+# keeps columns, dtypes and response bytes identical while holding a single copy.
+_STOCKOUT_FRAMES: dict[Path, pd.DataFrame] = {}
+_STOCKOUT_LOCK = threading.Lock()
 
 
 def _match_mask(series: pd.Series, q: str) -> pd.Series:
@@ -52,7 +62,18 @@ class DataRepository:
     def json(self,name):
         p=self.root/name
         return json.loads(p.read_text()) if p.exists() else {}
-    def stockout(self): return self._read('stockout_predictions.csv',dtype=_STOCKOUT_DTYPES)
+    def stockout(self):
+        key=self.root.resolve()
+        frame=_STOCKOUT_FRAMES.get(key)
+        if frame is not None: return frame
+        with _STOCKOUT_LOCK:
+            frame=_STOCKOUT_FRAMES.get(key)
+            if frame is None:
+                frame=self._read('stockout_predictions.csv',dtype=_STOCKOUT_DTYPES)
+                # A missing/unreadable file is not cached, so the original
+                # re-attempt-on-every-call behaviour stays for empty frames.
+                if not frame.empty: _STOCKOUT_FRAMES[key]=frame
+        return frame
     def suppliers(self): return self._read('supplier_intelligence.csv')
     def warehouses(self): return self._read('warehouses.csv')
     def inventory(self): return self._read('inventory_snapshots.csv',dtype=_INVENTORY_DTYPES)
