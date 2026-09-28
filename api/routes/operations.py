@@ -2,7 +2,6 @@ from fastapi import APIRouter, HTTPException, Query
 import pandas as pd
 from api.services.data import DataRepository
 from api.schemas.common import OptimizationRequest
-from ml.optimization.model import SupplyOptimizer
 router=APIRouter(prefix='/api',tags=['operations']); repo=DataRepository()
 
 def page(df,limit,offset):
@@ -27,7 +26,12 @@ def search(q:str=Query(min_length=1,max_length=100)): return {'items':repo.searc
 def events(limit:int=100): return page(repo._read('shipment_events.csv'),limit,0)
 @router.post('/optimization/run')
 def optimization(req:OptimizationRequest):
-    suppliers=repo.suppliers(); warehouses=repo.warehouses(); demand=repo.demand(); inventory=repo.inventory()
+    from ml.optimization.model import SupplyOptimizer
+    suppliers=repo.suppliers(); warehouses=repo.warehouses(); demand=repo.demand()
+    # Drop the 2.77 M historical inventory rows before anything else allocates:
+    # solve() only reads the newest snapshot, and keeping the full frame alive
+    # for the whole OR-Tools run is ~104 MB over the Render Free 512 MiB limit.
+    inventory=SupplyOptimizer.latest_snapshot(repo.inventory())
     if req.product_id and not demand.empty: demand=demand[demand.product_id.astype(str)==req.product_id]
     if demand.empty: raise HTTPException(404,'Demand data unavailable for optimization')
     # Reuse existing optimizer contract; forecast_7d can be derived from recent demand.

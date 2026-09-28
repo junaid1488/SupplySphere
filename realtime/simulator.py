@@ -26,9 +26,24 @@ class SupplyChainSimulator:
         self._orders = self._load_ids('delivery_risk_predictions.csv','order_id',30)
     def _load_ids(self, file: str, col: str, n: int) -> list[str]:
         p=self.root/file
-        if p.exists():
-            df=pd.read_csv(p); return df[col].dropna().astype(str).drop_duplicates().head(n).tolist() if col in df else []
-        return []
+        if not p.exists():
+            return []
+        # Stream one column in chunks so multi-hundred-MB CSVs never load whole.
+        seen: list[str] = []
+        seen_set: set[str] = set()
+        try:
+            reader = pd.read_csv(p, usecols=[col], chunksize=50_000)
+        except ValueError:
+            return []
+        with reader as chunks:
+            for chunk in chunks:
+                for value in chunk[col].dropna().astype(str):
+                    if value not in seen_set:
+                        seen_set.add(value)
+                        seen.append(value)
+                        if len(seen) >= n:
+                            return seen
+        return seen
     def start(self):
         self.state.running=True
         self.state.started_at=self.state.started_at or datetime.now(timezone.utc).isoformat()

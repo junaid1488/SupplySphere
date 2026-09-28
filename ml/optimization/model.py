@@ -7,13 +7,25 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-try:
-    from ortools.linear_solver import pywraplp
+pywraplp = None
+ORTOOLS_AVAILABLE = False
+_ortools_resolved = False
 
-    ORTOOLS_AVAILABLE = True
-except ImportError:
-    pywraplp = None
-    ORTOOLS_AVAILABLE = False
+
+def _ensure_ortools() -> bool:
+    """Import ortools on first solver use; keep FastAPI startup light."""
+    global pywraplp, ORTOOLS_AVAILABLE, _ortools_resolved
+    if not _ortools_resolved:
+        _ortools_resolved = True
+        try:
+            from ortools.linear_solver import pywraplp as _pywraplp
+
+            pywraplp = _pywraplp
+            ORTOOLS_AVAILABLE = True
+        except ImportError:
+            pywraplp = None
+            ORTOOLS_AVAILABLE = False
+    return ORTOOLS_AVAILABLE
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -146,7 +158,7 @@ class SupplyOptimizer:
             stockout_penalty,
         )
 
-        if ORTOOLS_AVAILABLE:
+        if _ensure_ortools():
             try:
                 result = self._solve_ortools(
                     suppliers=suppliers,
@@ -346,8 +358,35 @@ class SupplyOptimizer:
         return out
 
     @staticmethod
+    def latest_snapshot(
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Return a mutable frame holding only the newest inventory snapshot.
+
+        ``inventory_snapshots.csv`` has 3.16 M rows (~104 MB of RSS) but every
+        consumer - cleaning, grouping and the OR-Tools model - only ever reads
+        the newest snapshot (395 k rows). Reducing before any work keeps that
+        104 MB out of the solver's working set, which is the difference between
+        fitting in the 512 MiB Render Free instance and being OOM-killed.
+        The returned frame is always safe to mutate in place.
+        """
+        if "snapshot_date" not in df.columns:
+            return df.copy()
+
+        valid_dates = df[
+            "snapshot_date"
+        ].dropna()
+
+        if valid_dates.empty:
+            return df.copy()
+
+        return df[
+            df["snapshot_date"] == valid_dates.max()
+        ]
+
+    @staticmethod
     def _clean_inventory(df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
+        out = SupplyOptimizer.latest_snapshot(df)
 
         required = [
             "warehouse_id",
@@ -368,16 +407,12 @@ class SupplyOptimizer:
                     )
                 out[column] = 0.0
 
-        out["warehouse_id"] = (
-            out["warehouse_id"]
-            .astype(str)
-            .str.strip()
+        out["warehouse_id"] = SupplyOptimizer._strip_id(
+            out["warehouse_id"],
         )
 
-        out["product_id"] = (
-            out["product_id"]
-            .astype(str)
-            .str.strip()
+        out["product_id"] = SupplyOptimizer._strip_id(
+            out["product_id"],
         )
 
         for column in [
@@ -402,22 +437,44 @@ class SupplyOptimizer:
         return out
 
     @staticmethod
+    def _strip_id(series: pd.Series) -> pd.Series:
+        """Strip surrounding whitespace without copying every row.
+
+        ``series.astype(str).str.strip()`` materialises a brand-new string for
+        each of the 3.16 M inventory rows: measured +789 MB transient and
+        +252 MB retained for ``product_id`` alone, which is what pushed
+        ``/api/optimization/run`` over the Render Free 512 MiB limit.
+        Only the distinct values can carry whitespace, so those are inspected
+        once and the replacement is applied only when something changed.
+        """
+        if (
+            isinstance(series.dtype, pd.CategoricalDtype)
+            and series.cat.categories.dtype == object
+        ):
+            # astype(object) on a categorical reuses the category strings
+            # instead of rebuilding 3.16 M of them.
+            values = series.astype(object)
+        else:
+            values = series.astype(str)
+
+        uniques = values.drop_duplicates()
+        stripped = uniques.str.strip()
+        if bool(stripped.equals(uniques)):
+            return values
+
+        changed = uniques[stripped.notna() & (stripped != uniques)]
+        if changed.empty:
+            return values
+        return values.replace(dict(zip(changed, stripped.loc[changed.index])))
+
+    @staticmethod
     def _latest_inventory(
         df: pd.DataFrame,
     ) -> pd.DataFrame:
-        out = df.copy()
-
-        if "snapshot_date" in out.columns:
-            valid_dates = out[
-                "snapshot_date"
-            ].dropna()
-
-            if not valid_dates.empty:
-                latest_date = valid_dates.max()
-
-                out = out[
-                    out["snapshot_date"] == latest_date
-                ].copy()
+        # latest_snapshot() already returns a mutable frame holding only the
+        # newest rows; copying the full 3.16 M-row frame first would cost
+        # ~110 MB of RSS that the boolean mask immediately discards.
+        out = SupplyOptimizer.latest_snapshot(df)
 
         out["available_inventory"] = (
             out["on_hand"]

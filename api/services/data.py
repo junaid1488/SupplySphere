@@ -2,26 +2,67 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import pandas as pd
-import joblib
 from configs.settings import settings
+
+# Low-cardinality string columns in the multi-million-row runtime CSVs.
+# Reading them as plain objects costs ~600-800 MB of RSS per file and pushes
+# the Render 512 MiB instance over its limit; as categoricals the same frame
+# costs 70-250 MB with identical values in API responses.
+_STOCKOUT_DTYPES = {
+    'warehouse_id': 'category',
+    'product_id': 'category',
+    'risk_level': 'category',
+    'expected_stockout_date': 'category',
+}
+_INVENTORY_DTYPES = {'warehouse_id': 'category', 'product_id': 'category'}
+
+
+def _match_mask(series: pd.Series, q: str) -> pd.Series:
+    """Substring-match a column without lowering every row.
+
+    ``series.astype(str).str.lower().str.contains(...)`` on the 3.16 M-row
+    stockout frame allocates 700-1200 MB (three full lowered string buffers).
+    Categorical columns keep their distinct values in ``.cat.categories``
+    (32 k for product_id, 12 for warehouse_id), so the match runs on those
+    and is mapped back with ``isin`` for a few MB.
+    """
+    if series.empty:
+        return pd.Series(False, index=series.index)
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        categories = series.cat.categories.astype(str)
+        matched = categories.str.lower().str.contains(q, regex=False, na=False)
+        if not bool(matched.any()):
+            return pd.Series(False, index=series.index)
+        return series.isin(categories[matched])
+    return series.astype(str).str.lower().str.contains(q, regex=False, na=False)
 
 class DataRepository:
     def __init__(self, root: Path | None = None): self.root=Path(root or settings.processed_data_dir)
-    def _read(self,name):
+    def _read(self,name,usecols=None,dtype=None):
         p=self.root/name
-        return pd.read_csv(p) if p.exists() else pd.DataFrame()
+        if not p.exists(): return pd.DataFrame()
+        kwargs={}
+        if usecols is not None: kwargs['usecols']=usecols
+        if dtype is not None: kwargs['dtype']=dtype
+        try: return pd.read_csv(p,**kwargs)
+        except ValueError:
+            # A requested column/dtype is not in this file: fall back to the
+            # original read so responses stay identical.
+            return pd.read_csv(p)
     def json(self,name):
         p=self.root/name
         return json.loads(p.read_text()) if p.exists() else {}
-    def stockout(self): return self._read('stockout_predictions.csv')
+    def stockout(self): return self._read('stockout_predictions.csv',dtype=_STOCKOUT_DTYPES)
     def suppliers(self): return self._read('supplier_intelligence.csv')
     def warehouses(self): return self._read('warehouses.csv')
-    def inventory(self): return self._read('inventory_snapshots.csv')
+    def inventory(self): return self._read('inventory_snapshots.csv',dtype=_INVENTORY_DTYPES)
     def delivery(self): return self._read('delivery_risk_predictions.csv')
     def forecast(self): return self._read('forecast_7d.csv') if (self.root/'forecast_7d.csv').exists() else pd.DataFrame()
     def demand(self): return self._read('daily_product_demand.csv')
     def transfers(self): return self._read('warehouse_transfer_recommendations.csv')
     def forecast_metrics(self) -> dict:
+        import joblib
+
         path = Path("ml/models/demand_forecast.joblib")
         if not path.exists():
             return {}
@@ -76,12 +117,16 @@ class DataRepository:
         }
     def search(self, q: str):
         q=q.lower().strip(); out=[]
-        for name,kind,cols in [('stockout_predictions.csv','SKU',['product_id','warehouse_id','risk_level']),('supplier_intelligence.csv','Supplier',['supplier_id','supplier_name','risk_level']),('warehouses.csv','Warehouse',['warehouse_id','city']),('delivery_risk_predictions.csv','Shipment',['order_id','risk_level'])]:
-            df=self._read(name)
+        # stockout_predictions.csv must be read with the categorical dtypes:
+        # as plain objects the three columns materialise ~900 MB of lowered
+        # copies inside _match_mask, which OOMs the 512 MiB Render instance.
+        for name,kind,cols,usecols,dtypes in [('stockout_predictions.csv','SKU',['product_id','warehouse_id','risk_level'],['product_id','warehouse_id','risk_level'],_STOCKOUT_DTYPES),('supplier_intelligence.csv','Supplier',['supplier_id','supplier_name','risk_level'],['supplier_id','supplier_name','risk_level'],None),('warehouses.csv','Warehouse',['warehouse_id','city'],['warehouse_id','city'],None),('delivery_risk_predictions.csv','Shipment',['order_id','risk_level'],['order_id','risk_level'],None)]:
+            dtype={k:v for k,v in dtypes.items() if k in usecols} if dtypes else None
+            df=self._read(name,usecols=usecols,dtype=dtype)
             if df.empty: continue
             mask=pd.Series(False,index=df.index)
             for c in cols:
-                if c in df: mask |= df[c].astype(str).str.lower().str.contains(q,regex=False,na=False)
+                if c in df: mask |= _match_mask(df[c],q)
             for r in df[mask].head(20).to_dict('records'):
                 rid=str(r.get(cols[0],'')); out.append({'type':kind,'id':rid,'label':rid,'status':r.get('status'),'risk_level':r.get('risk_level')})
         return out

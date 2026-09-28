@@ -88,6 +88,39 @@ def _empty(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
+def _latest_snapshot_rows(
+    path: Path,
+    columns: list[str],
+    date_col: str = "snapshot_date",
+    chunksize: int = 200_000,
+) -> pd.DataFrame:
+    """Stream a multi-million-row CSV and keep only the newest snapshot.
+
+    ``stockout_features.csv`` (~493 MB) and ``inventory_snapshots.csv`` (~169 MB)
+    hold ~3.16 M rows over a handful of snapshot dates. Reading them whole
+    peaks at 400-900 MB of RSS, which exceeds the Render Free 512 MiB limit.
+    A chunked pass that only retains rows for the newest date produces the
+    same rows while keeping the transient allocation to a single chunk.
+    """
+    kept: pd.DataFrame | None = None
+    latest = None
+    for chunk in pd.read_csv(path, usecols=columns, chunksize=chunksize):
+        chunk[date_col] = pd.to_datetime(chunk[date_col], errors="coerce")
+        chunk_max = chunk[date_col].max()
+        if pd.isna(chunk_max):
+            del chunk
+            continue
+        if latest is None or chunk_max > latest:
+            latest = chunk_max
+            kept = chunk[chunk[date_col] == chunk_max]
+        elif chunk_max == latest:
+            kept = pd.concat([kept, chunk[chunk[date_col] == chunk_max]])
+        del chunk
+    if kept is None:
+        return _empty(columns)
+    return kept.copy()
+
+
 def _clean_records(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -420,9 +453,9 @@ def demand_points(
             ]
         )
 
-    demand = pd.read_csv(
+    demand = _latest_snapshot_rows(
         stockout_path,
-        usecols=[
+        [
             "snapshot_date",
             "warehouse_id",
             "product_id",
@@ -430,16 +463,17 @@ def demand_points(
         ],
     )
 
-    demand["snapshot_date"] = pd.to_datetime(
-        demand["snapshot_date"],
-        errors="coerce",
-    )
-
-    latest = demand["snapshot_date"].max()
-
-    demand = demand[
-        demand["snapshot_date"] == latest
-    ].copy()
+    if demand.empty:
+        return _empty(
+            [
+                "warehouse_id",
+                "product_id",
+                "snapshot_date",
+                "forecast_7d",
+                "latitude",
+                "longitude",
+            ]
+        )
 
     demand["forecast_7d"] = pd.to_numeric(
         demand["forecast_7d"],
@@ -506,9 +540,9 @@ def inventory_points(
             ]
         )
 
-    inventory = pd.read_csv(
+    inventory = _latest_snapshot_rows(
         path,
-        usecols=[
+        [
             "snapshot_date",
             "warehouse_id",
             "product_id",
@@ -517,16 +551,19 @@ def inventory_points(
         ],
     )
 
-    inventory["snapshot_date"] = pd.to_datetime(
-        inventory["snapshot_date"],
-        errors="coerce",
-    )
-
-    latest = inventory["snapshot_date"].max()
-
-    inventory = inventory[
-        inventory["snapshot_date"] == latest
-    ].copy()
+    if inventory.empty:
+        return _empty(
+            [
+                "warehouse_id",
+                "product_id",
+                "snapshot_date",
+                "on_hand",
+                "reserved",
+                "available_inventory",
+                "latitude",
+                "longitude",
+            ]
+        )
 
     inventory["on_hand"] = pd.to_numeric(
         inventory["on_hand"],

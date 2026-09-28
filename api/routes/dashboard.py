@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import joblib
 import pandas as pd
 from fastapi import APIRouter
 
@@ -27,19 +26,24 @@ def _processed_path(name: str) -> Path:
     return repo.root / name
 
 
-def _read_csv(name: str, usecols: list[str] | None = None) -> pd.DataFrame:
+def _read_csv(name: str, usecols: list[str] | None = None, dtype: dict | None = None) -> pd.DataFrame:
     path = _processed_path(name)
     if not path.exists():
         return pd.DataFrame()
     if usecols:
+        kwargs: dict = {"usecols": usecols}
+        if dtype:
+            kwargs["dtype"] = {k: v for k, v in dtype.items() if k in usecols}
         try:
-            return pd.read_csv(path, usecols=usecols)
+            return pd.read_csv(path, **kwargs)
         except ValueError:
             return pd.read_csv(path)
     return pd.read_csv(path)
 
 
 def _forecast_metrics() -> dict:
+    import joblib
+
     path = Path("ml/models/demand_forecast.joblib")
 
     if not path.exists():
@@ -101,6 +105,7 @@ def _inventory_value():
     inventory = _read_csv(
         "inventory_snapshots.csv",
         usecols=["snapshot_date", "product_id", "on_hand"],
+        dtype={"product_id": "category"},
     )
     purchase_orders = _read_csv(
         "purchase_orders.csv",
@@ -169,6 +174,11 @@ def _stockout_risks() -> dict:
     stockout = _read_csv(
         "stockout_predictions.csv",
         usecols=["warehouse_id", "product_id", "risk_level"],
+        dtype={
+            "warehouse_id": "category",
+            "product_id": "category",
+            "risk_level": "category",
+        },
     )
 
     if stockout.empty or "risk_level" not in stockout.columns:
