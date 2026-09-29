@@ -62,7 +62,7 @@ def _whole_frame_inventory_value(root: Path) -> float | None:
         .groupby("product_id")["unit_cost"]
         .mean()
     )
-    latest["unit_cost"] = latest["product_id"].map(costs)
+    latest["unit_cost"] = latest["product_id"].map(costs).astype(float)
     coverage = float(latest["unit_cost"].notna().mean())
     if coverage < 0.95:
         return None

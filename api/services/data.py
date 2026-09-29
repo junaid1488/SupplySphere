@@ -6,10 +6,6 @@ import threading
 import pandas as pd
 from configs.settings import settings
 
-# Low-cardinality string columns in the multi-million-row runtime CSVs.
-# Reading them as plain objects costs ~600-800 MB of RSS per file and pushes
-# the Render 512 MiB instance over its limit; as categoricals the same frame
-# costs 70-250 MB with identical values in API responses.
 _STOCKOUT_DTYPES = {
     'warehouse_id': 'category',
     'product_id': 'category',
@@ -18,25 +14,13 @@ _STOCKOUT_DTYPES = {
 }
 _INVENTORY_DTYPES = {'warehouse_id': 'category', 'product_id': 'category'}
 
-# stockout_predictions.csv is a multi-million-row frame; re-reading it for
-# every request re-parses the file and briefly doubles peak RSS on the 512 MiB
-# Render instance. One frame is loaded per process (keyed by data root, so a
-# different root still reads its own file) and shared by every caller. All
-# consumers only take masks/slices/copies from it, so returning the same object
-# keeps columns, dtypes and response bytes identical while holding a single copy.
-_STOCKOUT_FRAMES: dict[Path, pd.DataFrame] = {}
-_STOCKOUT_LOCK = threading.Lock()
+_SMALL_FRAME_CACHE: dict[tuple, pd.DataFrame] = {}
+_SMALL_FRAME_LOCK = threading.Lock()
+
+_STOCKOUT_CHUNKSIZE = 200_000
 
 
 def _match_mask(series: pd.Series, q: str) -> pd.Series:
-    """Substring-match a column without lowering every row.
-
-    ``series.astype(str).str.lower().str.contains(...)`` on the 3.16 M-row
-    stockout frame allocates 700-1200 MB (three full lowered string buffers).
-    Categorical columns keep their distinct values in ``.cat.categories``
-    (32 k for product_id, 12 for warehouse_id), so the match runs on those
-    and is mapped back with ``isin`` for a few MB.
-    """
     if series.empty:
         return pd.Series(False, index=series.index)
     if isinstance(series.dtype, pd.CategoricalDtype):
@@ -46,6 +30,7 @@ def _match_mask(series: pd.Series, q: str) -> pd.Series:
             return pd.Series(False, index=series.index)
         return series.isin(categories[matched])
     return series.astype(str).str.lower().str.contains(q, regex=False, na=False)
+
 
 class DataRepository:
     def __init__(self, root: Path | None = None): self.root=Path(root or settings.processed_data_dir)
@@ -57,61 +42,85 @@ class DataRepository:
         if dtype is not None: kwargs['dtype']=dtype
         try: return pd.read_csv(p,**kwargs)
         except ValueError:
-            # A requested column/dtype is not in this file: fall back to the
-            # original read so responses stay identical.
             return pd.read_csv(p)
     def json(self,name):
         p=self.root/name
         return json.loads(p.read_text()) if p.exists() else {}
+    def _cached_small(self, key: tuple, name: str) -> pd.DataFrame:
+        frame = _SMALL_FRAME_CACHE.get(key)
+        if frame is not None:
+            return frame
+        with _SMALL_FRAME_LOCK:
+            frame = _SMALL_FRAME_CACHE.get(key)
+            if frame is None:
+                frame = self._read(name)
+                if not frame.empty:
+                    _SMALL_FRAME_CACHE[key] = frame
+        return frame
     def stockout(self):
-        key=self.root.resolve()
-        frame=_STOCKOUT_FRAMES.get(key)
-        if frame is not None: return frame
-        with _STOCKOUT_LOCK:
-            frame=_STOCKOUT_FRAMES.get(key)
-            if frame is None:
-                frame=self._read('stockout_predictions.csv',dtype=_STOCKOUT_DTYPES)
-                # A missing/unreadable file is not cached, so the original
-                # re-attempt-on-every-call behaviour stays for empty frames.
-                if not frame.empty: _STOCKOUT_FRAMES[key]=frame
-        return frame
+        return self._read('stockout_predictions.csv', dtype=_STOCKOUT_DTYPES)
+    def stockout_page(self, limit: int, offset: int, risk_level: str | None = None):
+        path = self.root / 'stockout_predictions.csv'
+        if not path.exists():
+            return {'items': [], 'total': 0, 'limit': limit, 'offset': offset}
+        items = []
+        total = 0
+        try:
+            chunks = pd.read_csv(path, dtype=_STOCKOUT_DTYPES, chunksize=_STOCKOUT_CHUNKSIZE)
+            for chunk in chunks:
+                if risk_level and 'risk_level' in chunk.columns:
+                    chunk = chunk[chunk['risk_level'].eq(risk_level)]
+                chunk_len = len(chunk)
+                if total + chunk_len > offset:
+                    start = max(0, offset - total)
+                    end = min(chunk_len, start + limit - len(items))
+                    if end > start:
+                        part = chunk.iloc[start:end]
+                        items.extend(part.where(part.notna(), None).to_dict('records'))
+                total += chunk_len
+                del chunk
+                if len(items) >= limit and total >= offset + limit:
+                    break
+            gc.collect()
+        except Exception:
+            return {'items': [], 'total': 0, 'limit': limit, 'offset': offset}
+        return {'items': items, 'total': total, 'limit': limit, 'offset': offset}
+    def stockout_risk_counts(self) -> dict:
+        path = self.root / 'stockout_predictions.csv'
+        if not path.exists():
+            return {"count": 0, "high": 0, "critical": 0}
+        high_pairs = set()
+        critical_pairs = set()
+        operational_pairs = set()
+        try:
+            chunks = pd.read_csv(path, usecols=['warehouse_id', 'product_id', 'risk_level'], dtype=_STOCKOUT_DTYPES, chunksize=_STOCKOUT_CHUNKSIZE)
+            for chunk in chunks:
+                if 'risk_level' not in chunk.columns:
+                    del chunk
+                    continue
+                high = chunk['risk_level'].eq('High')
+                critical = chunk['risk_level'].eq('Critical')
+                if {'warehouse_id', 'product_id'}.issubset(chunk.columns):
+                    for _, row in chunk.loc[high, ['warehouse_id', 'product_id']].drop_duplicates().iterrows():
+                        pair = (str(row['warehouse_id']), str(row['product_id']))
+                        high_pairs.add(pair)
+                        operational_pairs.add(pair)
+                    for _, row in chunk.loc[critical, ['warehouse_id', 'product_id']].drop_duplicates().iterrows():
+                        pair = (str(row['warehouse_id']), str(row['product_id']))
+                        critical_pairs.add(pair)
+                        operational_pairs.add(pair)
+                del chunk
+            gc.collect()
+        except Exception:
+            return {"count": 0, "high": 0, "critical": 0}
+        return {"count": len(operational_pairs), "high": len(high_pairs), "critical": len(critical_pairs)}
     def suppliers(self):
-        key = self.root.resolve()
-        frame = _STOCKOUT_FRAMES.get(('suppliers', key))
-        if frame is not None:
-            return frame
-        with _STOCKOUT_LOCK:
-            frame = _STOCKOUT_FRAMES.get(('suppliers', key))
-            if frame is None:
-                frame = self._read('supplier_intelligence.csv')
-                if not frame.empty:
-                    _STOCKOUT_FRAMES[('suppliers', key)] = frame
-        return frame
+        return self._cached_small(('suppliers', self.root.resolve()), 'supplier_intelligence.csv')
     def warehouses(self):
-        key = self.root.resolve()
-        frame = _STOCKOUT_FRAMES.get(('warehouses', key))
-        if frame is not None:
-            return frame
-        with _STOCKOUT_LOCK:
-            frame = _STOCKOUT_FRAMES.get(('warehouses', key))
-            if frame is None:
-                frame = self._read('warehouses.csv')
-                if not frame.empty:
-                    _STOCKOUT_FRAMES[('warehouses', key)] = frame
-        return frame
+        return self._cached_small(('warehouses', self.root.resolve()), 'warehouses.csv')
     def inventory(self): return self._read('inventory_snapshots.csv',dtype=_INVENTORY_DTYPES)
     def delivery(self):
-        key = self.root.resolve()
-        frame = _STOCKOUT_FRAMES.get(('delivery', key))
-        if frame is not None:
-            return frame
-        with _STOCKOUT_LOCK:
-            frame = _STOCKOUT_FRAMES.get(('delivery', key))
-            if frame is None:
-                frame = self._read('delivery_risk_predictions.csv')
-                if not frame.empty:
-                    _STOCKOUT_FRAMES[('delivery', key)] = frame
-        return frame
+        return self._cached_small(('delivery', self.root.resolve()), 'delivery_risk_predictions.csv')
     def forecast(self): return self._read('forecast_7d.csv') if (self.root/'forecast_7d.csv').exists() else pd.DataFrame()
     def demand(self): return self._read('daily_product_demand.csv')
     def transfers(self): return self._read('warehouse_transfer_recommendations.csv')
@@ -172,11 +181,30 @@ class DataRepository:
         }
     def search(self, q: str):
         q=q.lower().strip(); out=[]
-        # stockout_predictions.csv must be read with the categorical dtypes:
-        # as plain objects the three columns materialise ~900 MB of lowered
-        # copies inside _match_mask, which OOMs the 512 MiB Render instance.
         for name,kind,cols,usecols,dtypes in [('stockout_predictions.csv','SKU',['product_id','warehouse_id','risk_level'],['product_id','warehouse_id','risk_level'],_STOCKOUT_DTYPES),('supplier_intelligence.csv','Supplier',['supplier_id','supplier_name','risk_level'],['supplier_id','supplier_name','risk_level'],None),('warehouses.csv','Warehouse',['warehouse_id','city'],['warehouse_id','city'],None),('delivery_risk_predictions.csv','Shipment',['order_id','risk_level'],['order_id','risk_level'],None)]:
             dtype={k:v for k,v in dtypes.items() if k in usecols} if dtypes else None
+            if name == 'stockout_predictions.csv':
+                path = self.root / name
+                if not path.exists():
+                    continue
+                found = 0
+                try:
+                    for chunk in pd.read_csv(path, usecols=usecols, dtype=dtype, chunksize=_STOCKOUT_CHUNKSIZE):
+                        mask = pd.Series(False, index=chunk.index)
+                        for c in cols:
+                            if c in chunk:
+                                mask |= _match_mask(chunk[c], q)
+                        for r in chunk[mask].head(20 - found).to_dict('records'):
+                            rid = str(r.get(cols[0], ''))
+                            out.append({'type': kind, 'id': rid, 'label': rid, 'status': r.get('status'), 'risk_level': r.get('risk_level')})
+                            found += 1
+                        del chunk
+                        if found >= 20:
+                            break
+                    gc.collect()
+                except Exception:
+                    pass
+                continue
             df=self._read(name,usecols=usecols,dtype=dtype)
             if df.empty: continue
             mask=pd.Series(False,index=df.index)

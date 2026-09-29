@@ -9,11 +9,9 @@ def page(df,limit,offset):
 
 @router.get('/inventory')
 def inventory(limit:int=Query(100,ge=1,le=500),offset:int=Query(0,ge=0),risk_level:str|None=None):
-    d=repo.stockout()
-    if risk_level and 'risk_level' in d: d=d[d.risk_level.eq(risk_level)]
-    return page(d,limit,offset)
+    return repo.stockout_page(limit, offset, risk_level)
 @router.get('/inventory/stockout-risk')
-def stockout_risk(limit:int=Query(100,ge=1,le=500),offset:int=Query(0,ge=0)): return page(repo.stockout(),limit,offset)
+def stockout_risk(limit:int=Query(100,ge=1,le=500),offset:int=Query(0,ge=0)): return repo.stockout_page(limit, offset)
 @router.get('/suppliers')
 def suppliers(limit:int=Query(100,ge=1,le=500),offset:int=Query(0,ge=0)): return page(repo.suppliers(),limit,offset)
 @router.get('/warehouses')
@@ -52,9 +50,17 @@ def demand_forecast(limit:int=Query(100,ge=1,le=500),offset:int=Query(0,ge=0)):
     return page(d,limit,offset)
 @router.get('/inventory/{sku_id}')
 def inventory_sku(sku_id:str):
-    d=repo.stockout(); x=d[d.product_id.astype(str)==sku_id] if not d.empty and 'product_id' in d else d
-    if x.empty: raise HTTPException(404,'SKU not found')
-    return {'items':x.where(x.notna(),None).to_dict('records')}
+    items = []
+    offset = 0
+    batch_size = 500
+    while True:
+        batch = repo.stockout_page(batch_size, offset)
+        items.extend([r for r in batch['items'] if str(r.get('product_id','')) == sku_id])
+        offset += batch_size
+        if items or offset >= batch['total']:
+            break
+    if not items: raise HTTPException(404,'SKU not found')
+    return {'items':items}
 @router.get('/suppliers/{supplier_id}')
 def supplier_detail(supplier_id:str):
     d=repo.suppliers(); x=d[d.supplier_id.astype(str)==supplier_id] if not d.empty else d

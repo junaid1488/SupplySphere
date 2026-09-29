@@ -159,7 +159,7 @@ def _compute_inventory_value():
     del purchase_orders
     gc.collect()
 
-    inventory["unit_cost"] = inventory["product_id"].map(costs)
+    inventory["unit_cost"] = inventory["product_id"].map(costs).astype(float)
     del costs
     gc.collect()
 
@@ -178,26 +178,7 @@ def _compute_inventory_value():
 def _stockout_risks() -> dict:
     if _cache["stockout_risks"] is not _UNSET:
         return _cache["stockout_risks"]
-
-    stockout = repo.stockout()
-
-    if stockout.empty or "risk_level" not in stockout.columns:
-        result = {"count": 0, "high": 0, "critical": 0}
-        _cache["stockout_risks"] = result
-        return result
-
-    high = stockout["risk_level"].eq("High")
-    critical = stockout["risk_level"].eq("Critical")
-
-    if {"warehouse_id", "product_id"}.issubset(stockout.columns):
-        operational = stockout.loc[high | critical, ["warehouse_id", "product_id"]].drop_duplicates()
-        high_pairs = stockout.loc[high, ["warehouse_id", "product_id"]].drop_duplicates()
-        critical_pairs = stockout.loc[critical, ["warehouse_id", "product_id"]].drop_duplicates()
-        result = {"count": int(len(operational)), "high": int(len(high_pairs)), "critical": int(len(critical_pairs))}
-        _cache["stockout_risks"] = result
-        return result
-
-    result = {"count": int((high | critical).sum()), "high": int(high.sum()), "critical": int(critical.sum())}
+    result = repo.stockout_risk_counts()
     _cache["stockout_risks"] = result
     return result
 
