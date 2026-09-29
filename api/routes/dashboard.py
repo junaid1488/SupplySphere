@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import gc
 from pathlib import Path
 import pandas as pd
 from fastapi import APIRouter
@@ -10,8 +10,6 @@ from api.services.data import DataRepository
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 repo = DataRepository()
 
-# Module-level cache for expensive computations
-# Processed data is static during server lifetime
 _UNSET = object()
 _cache = {
     "stockout_risks": _UNSET,
@@ -102,68 +100,78 @@ def _inventory_value():
     if _cache["inventory_value"] is not _UNSET:
         return _cache["inventory_value"]
 
-    inventory = _read_csv(
-        "inventory_snapshots.csv",
-        usecols=["snapshot_date", "product_id", "on_hand"],
-        dtype={"product_id": "category"},
-    )
-    purchase_orders = _read_csv(
-        "purchase_orders.csv",
-        usecols=["product_id", "unit_cost"],
-    )
+    _cache["inventory_value"] = _compute_inventory_value()
+    return _cache["inventory_value"]
 
+
+# inventory_snapshots.csv holds 3.16 M rows over 8 snapshot dates.  Materialising
+# the whole frame just to read one date costs 242 MiB (the snapshot_date strings
+# alone are ~190 MiB) and peaked the process at 420 MiB - the single largest
+# allocation in the Dashboard warm-up.  Streaming it keeps only the newest
+# snapshot (395 k rows) and produces byte-identical numbers.
+_INVENTORY_CHUNKS = 200_000
+
+
+def _compute_inventory_value():
+    path = _processed_path("inventory_snapshots.csv")
+    if not path.exists():
+        return None
+
+    latest_snapshot = None
+    latest_parts: list[pd.DataFrame] = []
+
+    try:
+        chunks = pd.read_csv(
+            path,
+            usecols=["snapshot_date", "product_id", "on_hand"],
+            dtype={"product_id": "category"},
+            chunksize=_INVENTORY_CHUNKS,
+        )
+        for chunk in chunks:
+            dates = chunk["snapshot_date"]
+            chunk_max = dates.max()
+            if pd.isna(chunk_max):
+                del chunk
+                continue
+            if latest_snapshot is None or chunk_max > latest_snapshot:
+                latest_snapshot = chunk_max
+                latest_parts = [chunk[dates.eq(chunk_max)]]
+            elif chunk_max == latest_snapshot:
+                latest_parts.append(chunk[dates.eq(chunk_max)])
+            del chunk
+    except ValueError:
+        return None
+
+    if not latest_parts or latest_snapshot is None:
+        return None
+
+    inventory = pd.concat(latest_parts)
+    del latest_parts
+    gc.collect()
+
+    purchase_orders = _read_csv("purchase_orders.csv", usecols=["product_id", "unit_cost"])
     if inventory.empty or purchase_orders.empty:
-        _cache["inventory_value"] = None
+        del inventory, purchase_orders
+        gc.collect()
         return None
 
-    required_inventory = {
-        "snapshot_date",
-        "product_id",
-        "on_hand",
-    }
+    costs = purchase_orders.dropna(subset=["product_id", "unit_cost"]).groupby("product_id")["unit_cost"].mean()
+    del purchase_orders
+    gc.collect()
 
-    required_cost = {
-        "product_id",
-        "unit_cost",
-    }
+    inventory["unit_cost"] = inventory["product_id"].map(costs)
+    del costs
+    gc.collect()
 
-    if not required_inventory.issubset(inventory.columns):
-        _cache["inventory_value"] = None
-        return None
-
-    if not required_cost.issubset(purchase_orders.columns):
-        _cache["inventory_value"] = None
-        return None
-
-    latest_snapshot = inventory["snapshot_date"].max()
-
-    latest = inventory[
-        inventory["snapshot_date"].eq(latest_snapshot)
-    ].copy()
-
-    if latest.empty:
-        _cache["inventory_value"] = None
-        return None
-
-    costs = (
-        purchase_orders
-        .dropna(subset=["product_id", "unit_cost"])
-        .groupby("product_id")["unit_cost"]
-        .mean()
-    )
-
-    latest["unit_cost"] = latest["product_id"].map(costs)
-
-    coverage = float(latest["unit_cost"].notna().mean())
-
+    coverage = float(inventory["unit_cost"].notna().mean())
     if coverage < 0.95:
-        _cache["inventory_value"] = None
+        del inventory
+        gc.collect()
         return None
 
-    result = float(
-        (latest["on_hand"] * latest["unit_cost"]).sum()
-    )
-    _cache["inventory_value"] = result
+    result = float((inventory["on_hand"] * inventory["unit_cost"]).sum())
+    del inventory
+    gc.collect()
     return result
 
 
@@ -171,22 +179,10 @@ def _stockout_risks() -> dict:
     if _cache["stockout_risks"] is not _UNSET:
         return _cache["stockout_risks"]
 
-    stockout = _read_csv(
-        "stockout_predictions.csv",
-        usecols=["warehouse_id", "product_id", "risk_level"],
-        dtype={
-            "warehouse_id": "category",
-            "product_id": "category",
-            "risk_level": "category",
-        },
-    )
+    stockout = repo.stockout()
 
     if stockout.empty or "risk_level" not in stockout.columns:
-        result = {
-            "count": 0,
-            "high": 0,
-            "critical": 0,
-        }
+        result = {"count": 0, "high": 0, "critical": 0}
         _cache["stockout_risks"] = result
         return result
 
@@ -194,34 +190,14 @@ def _stockout_risks() -> dict:
     critical = stockout["risk_level"].eq("Critical")
 
     if {"warehouse_id", "product_id"}.issubset(stockout.columns):
-        operational = stockout.loc[
-            high | critical,
-            ["warehouse_id", "product_id"],
-        ].drop_duplicates()
-
-        high_pairs = stockout.loc[
-            high,
-            ["warehouse_id", "product_id"],
-        ].drop_duplicates()
-
-        critical_pairs = stockout.loc[
-            critical,
-            ["warehouse_id", "product_id"],
-        ].drop_duplicates()
-
-        result = {
-            "count": int(len(operational)),
-            "high": int(len(high_pairs)),
-            "critical": int(len(critical_pairs)),
-        }
+        operational = stockout.loc[high | critical, ["warehouse_id", "product_id"]].drop_duplicates()
+        high_pairs = stockout.loc[high, ["warehouse_id", "product_id"]].drop_duplicates()
+        critical_pairs = stockout.loc[critical, ["warehouse_id", "product_id"]].drop_duplicates()
+        result = {"count": int(len(operational)), "high": int(len(high_pairs)), "critical": int(len(critical_pairs))}
         _cache["stockout_risks"] = result
         return result
 
-    result = {
-        "count": int((high | critical).sum()),
-        "high": int(high.sum()),
-        "critical": int(critical.sum()),
-    }
+    result = {"count": int((high | critical).sum()), "high": int(high.sum()), "critical": int(critical.sum())}
     _cache["stockout_risks"] = result
     return result
 
@@ -230,17 +206,10 @@ def _delivery_risks() -> dict:
     if _cache["delivery_risks"] is not _UNSET:
         return _cache["delivery_risks"]
 
-    delivery = _read_csv(
-        "delivery_risk_predictions.csv",
-        usecols=["order_id", "risk_level"],
-    )
+    delivery = _read_csv("delivery_risk_predictions.csv", usecols=["order_id", "risk_level"])
 
     if delivery.empty or "risk_level" not in delivery.columns:
-        result = {
-            "count": 0,
-            "high": 0,
-            "critical": 0,
-        }
+        result = {"count": 0, "high": 0, "critical": 0}
         _cache["delivery_risks"] = result
         return result
 
@@ -248,35 +217,19 @@ def _delivery_risks() -> dict:
     critical = delivery["risk_level"].eq("Critical")
 
     if "order_id" in delivery.columns:
-        high_orders = delivery.loc[
-            high,
-            "order_id",
-        ].dropna().astype(str).drop_duplicates()
-
-        critical_orders = delivery.loc[
-            critical,
-            "order_id",
-        ].dropna().astype(str).drop_duplicates()
-
-        risky_orders = delivery.loc[
-            high | critical,
-            "order_id",
-        ].dropna().astype(str).drop_duplicates()
-
-        result = {
-            "count": int(len(risky_orders)),
-            "high": int(len(high_orders)),
-            "critical": int(len(critical_orders)),
-        }
+        high_orders = delivery.loc[high, "order_id"].dropna().astype(str).drop_duplicates()
+        critical_orders = delivery.loc[critical, "order_id"].dropna().astype(str).drop_duplicates()
+        risky_orders = delivery.loc[high | critical, "order_id"].dropna().astype(str).drop_duplicates()
+        result = {"count": int(len(risky_orders)), "high": int(len(high_orders)), "critical": int(len(critical_orders))}
         _cache["delivery_risks"] = result
+        del delivery, high, critical, high_orders, critical_orders, risky_orders
+        gc.collect()
         return result
 
-    result = {
-        "count": int((high | critical).sum()),
-        "high": int(high.sum()),
-        "critical": int(critical.sum()),
-    }
+    result = {"count": int((high | critical).sum()), "high": int(high.sum()), "critical": int(critical.sum())}
     _cache["delivery_risks"] = result
+    del delivery, high, critical
+    gc.collect()
     return result
 
 
@@ -284,17 +237,10 @@ def _supplier_risks() -> dict:
     if _cache["supplier_risks"] is not _UNSET:
         return _cache["supplier_risks"]
 
-    suppliers = _read_csv(
-        "supplier_intelligence.csv",
-        usecols=["risk_level", "supplier_id"],
-    )
+    suppliers = _read_csv("supplier_intelligence.csv", usecols=["risk_level", "supplier_id"])
 
     if suppliers.empty or "risk_level" not in suppliers.columns:
-        result = {
-            "count": 0,
-            "high": 0,
-            "critical": 0,
-        }
+        result = {"count": 0, "high": 0, "critical": 0}
         _cache["supplier_risks"] = result
         return result
 
@@ -302,53 +248,50 @@ def _supplier_risks() -> dict:
     critical = suppliers["risk_level"].eq("Critical")
 
     if "supplier_id" in suppliers.columns:
-        risky = suppliers.loc[
-            high | critical,
-            "supplier_id",
-        ].dropna().astype(str).drop_duplicates()
-
-        result = {
-            "count": int(len(risky)),
-            "high": int(high.sum()),
-            "critical": int(critical.sum()),
-        }
+        risky = suppliers.loc[high | critical, "supplier_id"].dropna().astype(str).drop_duplicates()
+        result = {"count": int(len(risky)), "high": int(high.sum()), "critical": int(critical.sum())}
         _cache["supplier_risks"] = result
+        del suppliers, high, critical, risky
+        gc.collect()
         return result
 
-    result = {
-        "count": int((high | critical).sum()),
-        "high": int(high.sum()),
-        "critical": int(critical.sum()),
-    }
+    result = {"count": int((high | critical).sum()), "high": int(high.sum()), "critical": int(critical.sum())}
     _cache["supplier_risks"] = result
+    del suppliers, high, critical
+    gc.collect()
     return result
 
 
-def _daily_sales() -> pd.DataFrame:
+def _daily_sales() -> dict:
     if _cache["daily_sales"] is not _UNSET:
         return _cache["daily_sales"]
     sales = _read_csv("daily_sales.csv", usecols=["revenue", "orders"])
-    _cache["daily_sales"] = sales
-    return sales
+    result = {
+        "revenue": float(sales["revenue"].sum()) if not sales.empty and "revenue" in sales.columns else None,
+        "orders": int(sales["orders"].sum()) if not sales.empty and "orders" in sales.columns else None,
+    }
+    del sales
+    gc.collect()
+    _cache["daily_sales"] = result
+    return result
 
 
-def _warm_caches_parallel() -> None:
-    """Warm all summary caches in parallel on first (cold) request."""
-    tasks = [
+def _warm_caches() -> None:
+    for fn in (
         _stockout_risks,
         _delivery_risks,
         _supplier_risks,
         _inventory_value,
         _daily_sales,
-    ]
-    with ThreadPoolExecutor(max_workers=min(len(tasks), 5)) as ex:
-        list(ex.map(lambda fn: fn(), tasks))
+    ):
+        fn()
+        gc.collect()
 
 
 @router.get("/summary")
 def summary():
     if any(v is _UNSET for v in _cache.values()):
-        _warm_caches_parallel()
+        _warm_caches()
 
     sales = _daily_sales()
     stockout = _stockout_risks()
@@ -356,28 +299,14 @@ def summary():
     suppliers = _supplier_risks()
     forecast = _forecast_metrics()
 
-    revenue = (
-        float(sales["revenue"].sum())
-        if not sales.empty and "revenue" in sales.columns
-        else None
-    )
-
-    orders = (
-        int(sales["orders"].sum())
-        if not sales.empty and "orders" in sales.columns
-        else None
-    )
-
     optimization = repo.json("phase10_summary.json")
-
     optimization_savings = optimization.get("estimated_savings")
-
     if optimization_savings is not None:
         optimization_savings = float(optimization_savings)
 
     return {
-        "revenue": revenue,
-        "orders": orders,
+        "revenue": sales["revenue"],
+        "orders": sales["orders"],
         "inventory_value": _inventory_value(),
         "stockout_risks": stockout["count"],
         "stockout_high": stockout["high"],

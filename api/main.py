@@ -1,11 +1,14 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from configs.settings import settings
 from api.routes import dashboard, operations, geospatial, tracking, realtime, mlops, insights, reports
 from dataset_analyzer import router as dataset_analyzer_router
 
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "https://supplysphere.vercel.app,http://localhost:5173").split(",") if o.strip()]
+
 app = FastAPI(title='SupplySphere API', version='1.2.0', description='Supply-chain control tower APIs for phases 0-17')
-app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 app.include_router(dashboard.router)
 app.include_router(operations.router)
 app.include_router(geospatial.router)

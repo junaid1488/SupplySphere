@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+import gc
 import json
 import threading
 import pandas as pd
@@ -74,10 +75,43 @@ class DataRepository:
                 # re-attempt-on-every-call behaviour stays for empty frames.
                 if not frame.empty: _STOCKOUT_FRAMES[key]=frame
         return frame
-    def suppliers(self): return self._read('supplier_intelligence.csv')
-    def warehouses(self): return self._read('warehouses.csv')
+    def suppliers(self):
+        key = self.root.resolve()
+        frame = _STOCKOUT_FRAMES.get(('suppliers', key))
+        if frame is not None:
+            return frame
+        with _STOCKOUT_LOCK:
+            frame = _STOCKOUT_FRAMES.get(('suppliers', key))
+            if frame is None:
+                frame = self._read('supplier_intelligence.csv')
+                if not frame.empty:
+                    _STOCKOUT_FRAMES[('suppliers', key)] = frame
+        return frame
+    def warehouses(self):
+        key = self.root.resolve()
+        frame = _STOCKOUT_FRAMES.get(('warehouses', key))
+        if frame is not None:
+            return frame
+        with _STOCKOUT_LOCK:
+            frame = _STOCKOUT_FRAMES.get(('warehouses', key))
+            if frame is None:
+                frame = self._read('warehouses.csv')
+                if not frame.empty:
+                    _STOCKOUT_FRAMES[('warehouses', key)] = frame
+        return frame
     def inventory(self): return self._read('inventory_snapshots.csv',dtype=_INVENTORY_DTYPES)
-    def delivery(self): return self._read('delivery_risk_predictions.csv')
+    def delivery(self):
+        key = self.root.resolve()
+        frame = _STOCKOUT_FRAMES.get(('delivery', key))
+        if frame is not None:
+            return frame
+        with _STOCKOUT_LOCK:
+            frame = _STOCKOUT_FRAMES.get(('delivery', key))
+            if frame is None:
+                frame = self._read('delivery_risk_predictions.csv')
+                if not frame.empty:
+                    _STOCKOUT_FRAMES[('delivery', key)] = frame
+        return frame
     def forecast(self): return self._read('forecast_7d.csv') if (self.root/'forecast_7d.csv').exists() else pd.DataFrame()
     def demand(self): return self._read('daily_product_demand.csv')
     def transfers(self): return self._read('warehouse_transfer_recommendations.csv')

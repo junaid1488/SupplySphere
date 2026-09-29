@@ -1708,20 +1708,30 @@ function MapView() {
   )
 }
 
+let _regionCache: { customers: Item[]; orders: Item[]; delivery: Item[] } | null = null
+
 function RegionAnalysis() {
   const [customers, setCustomers] =
-    React.useState<Item[]>([])
+    React.useState<Item[]>(_regionCache?.customers ?? [])
 
   const [orders, setOrders] =
-    React.useState<Item[]>([])
+    React.useState<Item[]>(_regionCache?.orders ?? [])
 
   const [delivery, setDelivery] =
-    React.useState<Item[]>([])
+    React.useState<Item[]>(_regionCache?.delivery ?? [])
 
   const [loading, setLoading] =
-    React.useState(true)
+    React.useState(!_regionCache)
 
   React.useEffect(() => {
+    if (_regionCache) {
+      setCustomers(_regionCache.customers)
+      setOrders(_regionCache.orders)
+      setDelivery(_regionCache.delivery)
+      setLoading(false)
+      return
+    }
+
     Promise.all([
       api(
         '/api/geospatial/customers?limit=10000',
@@ -1739,17 +1749,13 @@ function RegionAnalysis() {
           orderData,
           deliveryData,
         ]) => {
-          setCustomers(
-            customerData.items || [],
-          )
-
-          setOrders(
-            orderData.items || [],
-          )
-
-          setDelivery(
-            deliveryData.items || [],
-          )
+          const c = customerData.items || []
+          const o = orderData.items || []
+          const d = deliveryData.items || []
+          _regionCache = { customers: c, orders: o, delivery: d }
+          setCustomers(c)
+          setOrders(o)
+          setDelivery(d)
         },
       )
       .catch(() => undefined)
@@ -1967,6 +1973,8 @@ export default function OlistControlTower({ onBack }: { onBack: () => void }) {
       )
   }, [])
 
+  const tabDataCache = React.useRef<Record<string, ApiResponse | null>>({})
+
   React.useEffect(() => {
     const controller =
       new AbortController()
@@ -1999,8 +2007,16 @@ export default function OlistControlTower({ onBack }: { onBack: () => void }) {
       return () => controller.abort()
     }
 
+    if (tabDataCache.current[tab]) {
+      setData(tabDataCache.current[tab]!)
+      return () => controller.abort()
+    }
+
     api(path, signal)
-      .then(setData)
+      .then((data) => {
+        tabDataCache.current[tab] = data
+        setData(data)
+      })
       .catch((e) => {
         if (
           signal.aborted
