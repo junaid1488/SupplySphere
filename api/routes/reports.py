@@ -7,11 +7,13 @@ repo = DataRepository()
 
 @router.get("/reports")
 def reports():
-    stockout = repo.stockout()
+    # Streaming helpers: repo.stockout() / repo.inventory() each materialise a
+    # 3.16 M row frame (~1 GB peak) and OOM-kill the 512 MiB Render worker.
+    stockout_totals = repo.stockout_risk_totals()
     delivery = repo.delivery()
     suppliers = repo.suppliers()
     optimization = repo.optimization()
-    inventory = repo.inventory()
+    inventory_stats = repo.inventory_snapshot_stats()
     forecast = repo.forecast()
     daily_sales = repo._read('daily_sales.csv')
 
@@ -32,13 +34,11 @@ def reports():
         report["summary"]["revenue"] = revenue
         report["summary"]["orders"] = orders
 
-    if not stockout.empty and "risk_level" in stockout.columns:
-        high = stockout["risk_level"].eq("High")
-        critical = stockout["risk_level"].eq("Critical")
+    if stockout_totals["total"] > 0:
         report["inventory_risk"] = {
-            "total_at_risk": int((high | critical).sum()),
-            "high": int(high.sum()),
-            "critical": int(critical.sum()),
+            "total_at_risk": int(stockout_totals["high"] + stockout_totals["critical"]),
+            "high": int(stockout_totals["high"]),
+            "critical": int(stockout_totals["critical"]),
         }
 
     if not delivery.empty and "risk_level" in delivery.columns:
@@ -87,18 +87,13 @@ def reports():
             "transfers_recommended": optimization.get("transfer_rows"),
         }
 
-    if not inventory.empty:
-        latest_date = inventory["snapshot_date"].max() if "snapshot_date" in inventory.columns else None
-        if latest_date:
-            latest = inventory[inventory["snapshot_date"] == latest_date]
-            total_on_hand = float(latest["on_hand"].sum()) if "on_hand" in latest.columns else 0
-            zero_stock = int((latest["on_hand"] == 0).sum()) if "on_hand" in latest.columns else 0
-            report["operational_metrics"] = {
-                "latest_snapshot_date": latest_date,
-                "total_on_hand": total_on_hand,
-                "zero_stock_skus": zero_stock,
-                "unique_products": int(latest["product_id"].nunique()) if "product_id" in latest.columns else 0,
-                "unique_warehouses": int(latest["warehouse_id"].nunique()) if "warehouse_id" in latest.columns else 0,
-            }
+    if inventory_stats:
+        report["operational_metrics"] = {
+            "latest_snapshot_date": inventory_stats.get("latest_snapshot_date"),
+            "total_on_hand": inventory_stats.get("total_on_hand"),
+            "zero_stock_skus": inventory_stats.get("zero_stock_skus"),
+            "unique_products": inventory_stats.get("unique_products"),
+            "unique_warehouses": inventory_stats.get("unique_warehouses"),
+        }
 
     return report

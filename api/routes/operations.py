@@ -1,8 +1,11 @@
 from fastapi import APIRouter, HTTPException, Query
+import gc
 import pandas as pd
 from api.services.data import DataRepository
 from api.schemas.common import OptimizationRequest
 router=APIRouter(prefix='/api',tags=['operations']); repo=DataRepository()
+
+_forecast_cache = None
 
 def page(df,limit,offset):
     part=df.iloc[offset:offset+limit]; return {'items':part.where(part.notna(),None).to_dict('records'),'total':len(df),'limit':limit,'offset':offset}
@@ -41,12 +44,18 @@ def optimization(req:OptimizationRequest):
 def optimization_results(): return repo.optimization()
 @router.get('/demand/forecast')
 def demand_forecast(limit:int=Query(100,ge=1,le=500),offset:int=Query(0,ge=0)):
+    global _forecast_cache
+    if _forecast_cache is not None:
+        return page(_forecast_cache, limit, offset)
     d=repo.forecast()
     if d.empty:
         dem=repo.demand()
         if dem.empty: return page(d,limit,offset)
         col='demand_units' if 'demand_units' in dem.columns else 'demand'
         d=dem.groupby('product_id',as_index=False).agg(demand_7d=(col,lambda s: float(s.tail(7).sum())),demand_30d=(col,lambda s: float(s.tail(30).sum())))
+        del dem
+        gc.collect()
+    _forecast_cache = d
     return page(d,limit,offset)
 @router.get('/inventory/{sku_id}')
 def inventory_sku(sku_id:str):

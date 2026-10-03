@@ -4,22 +4,32 @@ from api.services.data import DataRepository
 router = APIRouter(prefix="/api", tags=["insights"])
 repo = DataRepository()
 
+# Static data -> compute once per process and reuse.  The streaming pass still
+# costs a few seconds, so caching keeps every request after the first cheap.
+_CACHE: dict | None = None
+
 
 @router.get("/insights")
 def insights():
-    stockout = repo.stockout()
+    global _CACHE
+    if _CACHE is not None:
+        payload = dict(_CACHE)
+        payload["generated_at"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+        return payload
+    # Streaming helpers only: repo.stockout() / repo.inventory() materialise
+    # 3.16 M row frames (~1 GB peak) which OOM-kills the Render 512 MiB worker
+    # and turns every following request into a 502.
+    stockout_totals = repo.stockout_risk_totals()
     delivery = repo.delivery()
     suppliers = repo.suppliers()
     optimization = repo.optimization()
-    inventory = repo.inventory()
+    inventory_stats = repo.inventory_snapshot_stats()
 
     insights_list = []
 
-    if not stockout.empty and "risk_level" in stockout.columns:
-        high_stockout = stockout["risk_level"].eq("High")
-        critical_stockout = stockout["risk_level"].eq("Critical")
-        critical_count = int(critical_stockout.sum())
-        high_count = int(high_stockout.sum())
+    if stockout_totals["total"] > 0:
+        critical_count = stockout_totals["critical"]
+        high_count = stockout_totals["high"]
 
         if critical_count > 0:
             insights_list.append({
@@ -124,22 +134,19 @@ def insights():
                 "count": 1,
             })
 
-    if not inventory.empty:
-        latest_date = inventory["snapshot_date"].max() if "snapshot_date" in inventory.columns else None
-        if latest_date:
-            latest = inventory[inventory["snapshot_date"] == latest_date]
-            total_on_hand = latest["on_hand"].sum() if "on_hand" in latest.columns else 0
-            zero_stock = int((latest["on_hand"] == 0).sum()) if "on_hand" in latest.columns else 0
+    if inventory_stats:
+        latest_date = inventory_stats.get("latest_snapshot_date")
+        zero_stock = int(inventory_stats.get("zero_stock_skus") or 0)
 
-            if zero_stock > 0:
-                insights_list.append({
-                    "category": "Inventory",
-                    "severity": "high",
-                    "title": f"{zero_stock} SKU(s) with Zero On-Hand Inventory",
-                    "description": f"As of {latest_date}, {zero_stock} SKUs show zero available stock across warehouses.",
-                    "action": "Verify stock positions and trigger emergency orders",
-                    "count": zero_stock,
-                })
+        if zero_stock > 0:
+            insights_list.append({
+                "category": "Inventory",
+                "severity": "high",
+                "title": f"{zero_stock} SKU(s) with Zero On-Hand Inventory",
+                "description": f"As of {latest_date}, {zero_stock} SKUs show zero available stock across warehouses.",
+                "action": "Verify stock positions and trigger emergency orders",
+                "count": zero_stock,
+            })
 
     if not insights_list:
         insights_list.append({
@@ -151,8 +158,10 @@ def insights():
             "count": 0,
         })
 
-    return {
+    payload = {
         "items": insights_list,
         "total": len(insights_list),
         "generated_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
     }
+    _CACHE = {"items": insights_list, "total": len(insights_list)}
+    return payload

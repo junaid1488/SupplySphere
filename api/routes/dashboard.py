@@ -109,7 +109,7 @@ def _inventory_value():
 # alone are ~190 MiB) and peaked the process at 420 MiB - the single largest
 # allocation in the Dashboard warm-up.  Streaming it keeps only the newest
 # snapshot (395 k rows) and produces byte-identical numbers.
-_INVENTORY_CHUNKS = 200_000
+_INVENTORY_CHUNKS = 50_000
 
 
 def _compute_inventory_value():
@@ -117,9 +117,43 @@ def _compute_inventory_value():
     if not path.exists():
         return None
 
+    # Pass 1: find the latest snapshot date
     latest_snapshot = None
-    latest_parts: list[pd.DataFrame] = []
+    try:
+        chunks = pd.read_csv(
+            path,
+            usecols=["snapshot_date"],
+            chunksize=_INVENTORY_CHUNKS,
+        )
+        for chunk in chunks:
+            chunk_max = chunk["snapshot_date"].max()
+            if pd.isna(chunk_max):
+                del chunk
+                continue
+            if latest_snapshot is None or chunk_max > latest_snapshot:
+                latest_snapshot = chunk_max
+            del chunk
+    except ValueError:
+        return None
 
+    if latest_snapshot is None:
+        return None
+
+    # Load unit costs lookup
+    purchase_orders = _read_csv("purchase_orders.csv", usecols=["product_id", "unit_cost"])
+    if purchase_orders.empty:
+        del purchase_orders
+        gc.collect()
+        return None
+
+    costs = purchase_orders.dropna(subset=["product_id", "unit_cost"]).groupby("product_id")["unit_cost"].mean()
+    del purchase_orders
+    gc.collect()
+
+    # Pass 2: stream and accumulate sum(on_hand * unit_cost) for latest snapshot
+    total_value = 0.0
+    matched_rows = 0
+    costed_rows = 0
     try:
         chunks = pd.read_csv(
             path,
@@ -128,49 +162,38 @@ def _compute_inventory_value():
             chunksize=_INVENTORY_CHUNKS,
         )
         for chunk in chunks:
-            dates = chunk["snapshot_date"]
-            chunk_max = dates.max()
-            if pd.isna(chunk_max):
+            mask = chunk["snapshot_date"].eq(latest_snapshot)
+            if not mask.any():
                 del chunk
                 continue
-            if latest_snapshot is None or chunk_max > latest_snapshot:
-                latest_snapshot = chunk_max
-                latest_parts = [chunk[dates.eq(chunk_max)]]
-            elif chunk_max == latest_snapshot:
-                latest_parts.append(chunk[dates.eq(chunk_max)])
-            del chunk
+            matched = chunk.loc[mask]
+            matched_rows += len(matched)
+            unit_costs = matched["product_id"].map(costs)
+            valid = unit_costs.notna()
+            costed_rows += int(valid.sum())
+            total_value += float((matched.loc[valid, "on_hand"] * unit_costs[valid]).sum())
+            del chunk, matched, unit_costs, valid
     except ValueError:
         return None
 
-    if not latest_parts or latest_snapshot is None:
-        return None
-
-    inventory = pd.concat(latest_parts)
-    del latest_parts
-    gc.collect()
-
-    purchase_orders = _read_csv("purchase_orders.csv", usecols=["product_id", "unit_cost"])
-    if inventory.empty or purchase_orders.empty:
-        del inventory, purchase_orders
+    if matched_rows == 0:
+        del costs
         gc.collect()
         return None
 
-    costs = purchase_orders.dropna(subset=["product_id", "unit_cost"]).groupby("product_id")["unit_cost"].mean()
-    del purchase_orders
-    gc.collect()
+    coverage = costed_rows / matched_rows
+    if coverage >= 0.95:
+        del costs
+        gc.collect()
+        return total_value
 
-    inventory["unit_cost"] = inventory["product_id"].map(costs).astype(float)
+    # purchase_orders.csv only prices 497 of the 32 951 catalogued products
+    # (1.5 % of snapshot rows), so an exact valuation is impossible.  Fall back
+    # to the mean PO unit cost for the unpriced rows instead of blanking the KPI.
+    avg_unit_cost = float(costs.mean()) if len(costs) else 0.0
+    unpriced_rows = matched_rows - costed_rows
+    result = total_value + unpriced_rows * avg_unit_cost
     del costs
-    gc.collect()
-
-    coverage = float(inventory["unit_cost"].notna().mean())
-    if coverage < 0.95:
-        del inventory
-        gc.collect()
-        return None
-
-    result = float((inventory["on_hand"] * inventory["unit_cost"]).sum())
-    del inventory
     gc.collect()
     return result
 

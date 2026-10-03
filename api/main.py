@@ -1,4 +1,5 @@
 import os
+import threading
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from configs.settings import settings
@@ -29,3 +30,19 @@ def health():
         'api_version': '1.2.0',
         'components': ['api', 'realtime', 'mlops', 'dataset_analyzer'],
     }
+
+
+def _warm_expensive_routes() -> None:
+    """Compute the derived aggregates once, right after boot, so the first user
+    request is not the one paying the multi-second streaming pass."""
+    try:
+        dashboard._warm_caches()
+        insights.insights()
+        reports.reports()
+    except Exception:
+        pass
+
+
+@app.on_event('startup')
+def _schedule_warmup() -> None:
+    threading.Thread(target=_warm_expensive_routes, daemon=True).start()
