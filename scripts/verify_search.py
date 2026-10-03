@@ -76,39 +76,63 @@ def original_search(repo: DataRepository, q: str) -> list[dict]:
 
 def main() -> None:
     repo = DataRepository()
+    from api.services import data as data_module
+
     failures = 0
-    for q in QUERIES:
-        t0 = time.time()
-        expected = original_search(repo, q)
-        old_s = time.time() - t0
+    for pass_label, prepare in (
+        ("cold (no search domains)", lambda: None),
+        ("warm (risk + warehouse domains known)", _prepare_domains),
+    ):
+        print(f"=== pass: {pass_label} ===")
+        prepare()
+        for q in QUERIES:
+            data_module._SEARCH_CACHE.clear()
+            t0 = time.time()
+            expected = original_search(repo, q)
+            old_s = time.time() - t0
 
-        t0 = time.time()
-        actual = repo.search(q)
-        new_s = time.time() - t0
+            t0 = time.time()
+            actual = repo.search(q)
+            new_s = time.time() - t0
 
-        ok = expected == actual
-        if not ok:
-            failures += 1
-        print(
-            f"{'PASS' if ok else 'FAIL'} q={q!r}: {len(actual)} results | "
-            f"old {old_s:.2f}s -> new {new_s:.2f}s"
-        )
-        if not ok:
-            print("  expected[:3]:", expected[:3])
-            print("  actual[:3]  :", actual[:3])
+            ok = expected == actual
+            if not ok:
+                failures += 1
+            print(
+                f"  {'PASS' if ok else 'FAIL'} q={q!r}: {len(actual)} results | "
+                f"old {old_s:.2f}s -> new {new_s:.2f}s"
+            )
+            if not ok:
+                print("    expected[:3]:", expected[:3])
+                print("    actual[:3]  :", actual[:3])
 
-        # cached repeat must be identical and fast
-        t0 = time.time()
-        again = repo.search(q)
-        cached_s = time.time() - t0
-        if again != expected:
-            failures += 1
-            print(f"  FAIL cached repeat for {q!r}")
-        else:
-            print(f"  cached repeat: {len(again)} results in {cached_s * 1000:.1f} ms")
+            t0 = time.time()
+            again = repo.search(q)
+            cached_s = time.time() - t0
+            if again != expected:
+                failures += 1
+                print(f"    FAIL cached repeat for {q!r}")
+            else:
+                print(f"    cached repeat: {len(again)} results in {cached_s * 1000:.1f} ms")
 
     print("ALL PASS" if failures == 0 else f"{failures} FAILURES")
     sys.exit(1 if failures else 0)
+
+
+def _prepare_domains() -> None:
+    """Populate the exact value domains the pruned search path relies on."""
+    from api.services import data as data_module
+
+    repo = DataRepository()
+    repo.stockout_risk_totals()
+    repo.stockout_risk_counts()
+    repo._warehouse_search_domain()
+    print(
+        "  domains: risk=",
+        sorted(data_module._DERIVED_CACHE.get("stockout_risk_levels", [])),
+        "| warehouse=",
+        data_module._DERIVED_CACHE.get("warehouse_search_domain"),
+    )
 
 
 if __name__ == "__main__":

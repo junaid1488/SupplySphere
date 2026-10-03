@@ -27,13 +27,13 @@ _DERIVED_LOCK = threading.Lock()
 _STOCKOUT_CHUNKSIZE = 50_000
 _INVENTORY_CHUNKS = 50_000
 
-# /api/search bounds: 20 k row chunks (small per-chunk allocation), a gc every
-# _SEARCH_GC_EVERY chunks so chunk frames return to the OS, at most
-# _SEARCH_MAX_RESULTS rows retained per source file, and a tiny LRU of results.
-# Together these keep the scan well inside the Render Free 512 MiB budget.
-_SEARCH_CHUNKSIZE = 10_000
+# /api/search bounds: 50 k row chunks with a gc every _SEARCH_GC_EVERY chunks
+# (250 k rows) so chunk frames return to the OS, at most _SEARCH_MAX_RESULTS rows
+# retained per source file, plus a tiny LRU of finished results.  Together these
+# keep a full scan (~133 MB peak, measured) inside the Render Free 512 MiB budget.
+_SEARCH_CHUNKSIZE = 50_000
 _SEARCH_MAX_RESULTS = 20
-_SEARCH_GC_EVERY = 10
+_SEARCH_GC_EVERY = 5
 _SEARCH_CACHE_MAX = 64
 _SEARCH_CACHE: OrderedDict[str, list[dict]] = OrderedDict()
 _SEARCH_CACHE_LOCK = threading.Lock()
@@ -92,6 +92,7 @@ class DataRepository:
         high = 0
         critical = 0
         total = 0
+        levels: set[str] = set()
         with _DERIVED_LOCK:
             cached = _DERIVED_CACHE.get('stockout_risk_totals')
             if cached is not None:
@@ -101,6 +102,7 @@ class DataRepository:
                     if 'risk_level' not in chunk.columns:
                         del chunk
                         continue
+                    levels.update(str(v) for v in chunk['risk_level'].dropna().unique().tolist())
                     high += int(chunk['risk_level'].eq('High').sum())
                     critical += int(chunk['risk_level'].eq('Critical').sum())
                     total += len(chunk)
@@ -108,6 +110,8 @@ class DataRepository:
                 gc.collect()
             except Exception:
                 return empty
+            if levels:
+                _DERIVED_CACHE['stockout_risk_levels'] = levels
             result = {"high": high, "critical": critical, "total": total}
             _DERIVED_CACHE['stockout_risk_totals'] = result
             return result
@@ -194,12 +198,18 @@ class DataRepository:
         high_pairs = set()
         critical_pairs = set()
         operational_pairs = set()
+        levels: set[str] = set()
         try:
             chunks = pd.read_csv(path, usecols=['warehouse_id', 'product_id', 'risk_level'], dtype=_STOCKOUT_DTYPES, chunksize=_STOCKOUT_CHUNKSIZE)
             for chunk in chunks:
                 if 'risk_level' not in chunk.columns:
                     del chunk
                     continue
+                risk_col = chunk['risk_level']
+                if hasattr(risk_col, 'cat'):
+                    levels.update(str(v) for v in risk_col.cat.categories.tolist())
+                else:
+                    levels.update(str(v) for v in risk_col.dropna().unique().tolist())
                 high = chunk['risk_level'].eq('High')
                 critical = chunk['risk_level'].eq('Critical')
                 if {'warehouse_id', 'product_id'}.issubset(chunk.columns):
@@ -215,6 +225,8 @@ class DataRepository:
                     del critical_df, pairs
                 del chunk
             gc.collect()
+            if levels:
+                _DERIVED_CACHE['stockout_risk_levels'] = levels
         except Exception:
             return {"count": 0, "high": 0, "critical": 0}
         return {"count": len(operational_pairs), "high": len(high_pairs), "critical": len(critical_pairs)}
@@ -283,6 +295,24 @@ class DataRepository:
             'demand_snapshot_date': x.get('demand_snapshot_date'),
             'time_limit_ms': x.get('time_limit_ms'),
         }
+    def _warehouse_search_domain(self) -> list[str] | None:
+        """Lower-cased warehouse ids from warehouses.csv (12 rows, cached).
+        Returns None when the domain is unknown so callers never prune."""
+        cached = _DERIVED_CACHE.get('warehouse_search_domain')
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        try:
+            frame = self.warehouses()
+        except Exception:
+            return None
+        if frame is None or frame.empty or 'warehouse_id' not in frame.columns:
+            return None
+        domain = sorted({str(v).lower() for v in frame['warehouse_id'].dropna().unique().tolist()})
+        if not domain:
+            return None
+        _DERIVED_CACHE['warehouse_search_domain'] = domain
+        return domain
+
     def search(self, q: str):
         key = q.lower().strip()
         with _SEARCH_CACHE_LOCK:
@@ -306,16 +336,43 @@ class DataRepository:
                 path = self.root / name
                 if not path.exists():
                     continue
+                read_cols = list(usecols)
+                match_cols = list(cols)
+                # Every product_id in the file is a 32-char lowercase hex string
+                # (verified over all 3.16 M rows), so a query containing any
+                # non-hex character can never be a substring of one.
+                if 'product_id' in match_cols and any(ch not in '0123456789abcdef' for ch in q):
+                    match_cols.remove('product_id')
+                # warehouse_id domain comes from warehouses.csv (12 ids).  It is
+                # also safe to drop the column from the read: warehouse_id is
+                # never echoed back in the payload (only product_id/risk_level).
+                wh_domain = self._warehouse_search_domain()
+                if wh_domain is not None and 'warehouse_id' in match_cols:
+                    if not any(q in w for w in wh_domain):
+                        match_cols.remove('warehouse_id')
+                        if 'warehouse_id' in read_cols:
+                            read_cols.remove('warehouse_id')
+                # risk_level domain is collected while this same file is
+                # streamed during warm-up.  The column stays in the read
+                # (SKU rows echo risk_level back) - it is only un-matched.
+                risk_domain = _DERIVED_CACHE.get('stockout_risk_levels')
+                if risk_domain is not None and 'risk_level' in match_cols:
+                    if not any(q in str(level).lower() for level in risk_domain):
+                        match_cols.remove('risk_level')
+                if not match_cols:
+                    # Nothing in this file can match the query -> skip the scan.
+                    continue
+                dtype = {k: v for k, v in dtypes.items() if k in read_cols}
                 found = 0
                 seen = 0
                 try:
-                    # Bounded scan: small chunks so no single allocation is large,
-                    # a periodic gc.collect() so chunk frames return to the OS
-                    # instead of growing RSS to ~330 MB, and an early exit once
-                    # the 20 requested rows are collected.
-                    for chunk in pd.read_csv(path, usecols=usecols, dtype=dtype, chunksize=_SEARCH_CHUNKSIZE):
+                    # Bounded scan: chunks sized so no single allocation is
+                    # large, a periodic gc.collect() so chunk frames return to
+                    # the OS instead of growing RSS to ~330 MB, and an early
+                    # exit once the 20 requested rows are collected.
+                    for chunk in pd.read_csv(path, usecols=read_cols, dtype=dtype, chunksize=_SEARCH_CHUNKSIZE):
                         mask = None
-                        for c in cols:
+                        for c in match_cols:
                             if c in chunk:
                                 matched = _match_mask(chunk[c], q)
                                 mask = matched if mask is None else (mask | matched)
