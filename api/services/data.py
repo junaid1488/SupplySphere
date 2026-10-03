@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import OrderedDict
 from pathlib import Path
 import gc
 import json
@@ -25,6 +26,17 @@ _DERIVED_LOCK = threading.Lock()
 
 _STOCKOUT_CHUNKSIZE = 50_000
 _INVENTORY_CHUNKS = 50_000
+
+# /api/search bounds: 20 k row chunks (small per-chunk allocation), a gc every
+# _SEARCH_GC_EVERY chunks so chunk frames return to the OS, at most
+# _SEARCH_MAX_RESULTS rows retained per source file, and a tiny LRU of results.
+# Together these keep the scan well inside the Render Free 512 MiB budget.
+_SEARCH_CHUNKSIZE = 10_000
+_SEARCH_MAX_RESULTS = 20
+_SEARCH_GC_EVERY = 10
+_SEARCH_CACHE_MAX = 64
+_SEARCH_CACHE: OrderedDict[str, list[dict]] = OrderedDict()
+_SEARCH_CACHE_LOCK = threading.Lock()
 
 
 def _match_mask(series: pd.Series, q: str) -> pd.Series:
@@ -272,7 +284,22 @@ class DataRepository:
             'time_limit_ms': x.get('time_limit_ms'),
         }
     def search(self, q: str):
-        q=q.lower().strip(); out=[]
+        key = q.lower().strip()
+        with _SEARCH_CACHE_LOCK:
+            cached = _SEARCH_CACHE.get(key)
+            if cached is not None:
+                _SEARCH_CACHE.move_to_end(key)
+                return [dict(item) for item in cached]
+        out = self._compute_search(key)
+        with _SEARCH_CACHE_LOCK:
+            _SEARCH_CACHE[key] = [dict(item) for item in out]
+            _SEARCH_CACHE.move_to_end(key)
+            while len(_SEARCH_CACHE) > _SEARCH_CACHE_MAX:
+                _SEARCH_CACHE.popitem(last=False)
+        return out
+
+    def _compute_search(self, q: str) -> list[dict]:
+        out: list[dict] = []
         for name,kind,cols,usecols,dtypes in [('stockout_predictions.csv','SKU',['product_id','warehouse_id','risk_level'],['product_id','warehouse_id','risk_level'],_STOCKOUT_DTYPES),('supplier_intelligence.csv','Supplier',['supplier_id','supplier_name','risk_level'],['supplier_id','supplier_name','risk_level'],None),('warehouses.csv','Warehouse',['warehouse_id','city'],['warehouse_id','city'],None),('delivery_risk_predictions.csv','Shipment',['order_id','risk_level'],['order_id','risk_level'],None)]:
             dtype={k:v for k,v in dtypes.items() if k in usecols} if dtypes else None
             if name == 'stockout_predictions.csv':
@@ -280,19 +307,31 @@ class DataRepository:
                 if not path.exists():
                     continue
                 found = 0
+                seen = 0
                 try:
-                    for chunk in pd.read_csv(path, usecols=usecols, dtype=dtype, chunksize=_STOCKOUT_CHUNKSIZE):
-                        mask = pd.Series(False, index=chunk.index)
+                    # Bounded scan: small chunks so no single allocation is large,
+                    # a periodic gc.collect() so chunk frames return to the OS
+                    # instead of growing RSS to ~330 MB, and an early exit once
+                    # the 20 requested rows are collected.
+                    for chunk in pd.read_csv(path, usecols=usecols, dtype=dtype, chunksize=_SEARCH_CHUNKSIZE):
+                        mask = None
                         for c in cols:
                             if c in chunk:
-                                mask |= _match_mask(chunk[c], q)
-                        for r in chunk[mask].head(20 - found).to_dict('records'):
-                            rid = str(r.get(cols[0], ''))
-                            out.append({'type': kind, 'id': rid, 'label': rid, 'status': r.get('status'), 'risk_level': r.get('risk_level')})
-                            found += 1
-                        del chunk
-                        if found >= 20:
+                                matched = _match_mask(chunk[c], q)
+                                mask = matched if mask is None else (mask | matched)
+                        if mask is not None and bool(mask.any()):
+                            take = _SEARCH_MAX_RESULTS - found
+                            if take > 0:
+                                for r in chunk.loc[mask].head(take).to_dict('records'):
+                                    rid = str(r.get(cols[0], ''))
+                                    out.append({'type': kind, 'id': rid, 'label': rid, 'status': r.get('status'), 'risk_level': r.get('risk_level')})
+                                    found += 1
+                        seen += 1
+                        del chunk, mask
+                        if found >= _SEARCH_MAX_RESULTS:
                             break
+                        if seen % _SEARCH_GC_EVERY == 0:
+                            gc.collect()
                     gc.collect()
                 except Exception:
                     pass
@@ -302,6 +341,6 @@ class DataRepository:
             mask=pd.Series(False,index=df.index)
             for c in cols:
                 if c in df: mask |= _match_mask(df[c],q)
-            for r in df[mask].head(20).to_dict('records'):
+            for r in df[mask].head(_SEARCH_MAX_RESULTS).to_dict('records'):
                 rid=str(r.get(cols[0],'')); out.append({'type':kind,'id':rid,'label':rid,'status':r.get('status'),'risk_level':r.get('risk_level')})
         return out
