@@ -1,0 +1,20 @@
+name: Keep API Awake
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Render health endpoint
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 \
+            https://supplysphere-api.onrender.com/api/health || true)
+          echo "Render /api/health -> $code"
+          if [ "$code" != "200" ]; then
+            echo "::warning::Render API did not return 200 (got $code)"
+          fi
