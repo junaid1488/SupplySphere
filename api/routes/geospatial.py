@@ -1,4 +1,5 @@
 from collections import OrderedDict
+import gc
 import threading
 
 from fastapi import APIRouter, Query
@@ -59,6 +60,7 @@ def _cached_records(key: str, builder, limit: int, offset: int) -> dict:
             df = builder()
         payload = records(df, limit, offset)
         del df
+        gc.collect()
         with _CACHE_LOCK:
             _PAYLOAD_CACHE[cache_key] = payload
             _PAYLOAD_CACHE.move_to_end(cache_key)
