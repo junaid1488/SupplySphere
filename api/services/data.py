@@ -38,6 +38,18 @@ _SEARCH_CACHE_MAX = 64
 _SEARCH_CACHE: OrderedDict[str, list[dict]] = OrderedDict()
 _SEARCH_CACHE_LOCK = threading.Lock()
 
+# ml/stockout/model.py::risk_level() only ever returns one of these four
+# strings, so the deployed code is a guaranteed superset of the values present
+# in stockout_predictions.csv.  A superset can never cause a wrong skip, which
+# makes risk_level pruning safe from the very first request after boot - no
+# warm-up pass over the 293 MB file required.
+_STOCKOUT_RISK_DOMAIN = ("Critical", "High", "Medium", "Low")
+
+# product_id / warehouse_id domains come from these tiny files; a domain is
+# only trusted when it is large enough to be a real catalog (the stockout file
+# spans 32 951 products / 12 warehouses).
+_PRODUCT_DOMAIN_MIN_PRODUCTS = 1_000
+
 
 def _match_mask(series: pd.Series, q: str) -> pd.Series:
     if series.empty:
@@ -295,6 +307,29 @@ class DataRepository:
             'demand_snapshot_date': x.get('demand_snapshot_date'),
             'time_limit_ms': x.get('time_limit_ms'),
         }
+    def _product_search_domain(self) -> list[str] | None:
+        """Lower-cased product ids taken from recommended_inventory_by_warehouse
+        (24 MB, covers all 32 951 catalogued products - verified).  Used to skip
+        the 293 MB stockout scan when no known product can match the query.
+        Returns None when the domain is unavailable or looks partial."""
+        cached = _DERIVED_CACHE.get('product_search_domain')
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        path = self.root / 'recommended_inventory_by_warehouse.csv'
+        if not path.exists():
+            return None
+        try:
+            frame = pd.read_csv(path, usecols=['product_id'])
+        except Exception:
+            return None
+        if frame.empty or 'product_id' not in frame.columns:
+            return None
+        domain = sorted({str(v).lower() for v in frame['product_id'].dropna().unique().tolist()})
+        if len(domain) < _PRODUCT_DOMAIN_MIN_PRODUCTS:
+            return None
+        _DERIVED_CACHE['product_search_domain'] = domain
+        return domain
+
     def _warehouse_search_domain(self) -> list[str] | None:
         """Lower-cased warehouse ids from warehouses.csv (12 rows, cached).
         Returns None when the domain is unknown so callers never prune."""
@@ -338,11 +373,17 @@ class DataRepository:
                     continue
                 read_cols = list(usecols)
                 match_cols = list(cols)
-                # Every product_id in the file is a 32-char lowercase hex string
-                # (verified over all 3.16 M rows), so a query containing any
-                # non-hex character can never be a substring of one.
-                if 'product_id' in match_cols and any(ch not in '0123456789abcdef' for ch in q):
-                    match_cols.remove('product_id')
+                # product_id: every id in the file is a 32-char lowercase hex
+                # string (verified over all 3.16 M rows) and the whole catalog is
+                # known from recommended_inventory_by_warehouse.csv, so a query
+                # that matches neither can never match a stockout row.
+                if 'product_id' in match_cols:
+                    if any(ch not in '0123456789abcdef' for ch in q):
+                        match_cols.remove('product_id')
+                    else:
+                        product_domain = self._product_search_domain()
+                        if product_domain is not None and not any(q in pid for pid in product_domain):
+                            match_cols.remove('product_id')
                 # warehouse_id domain comes from warehouses.csv (12 ids).  It is
                 # also safe to drop the column from the read: warehouse_id is
                 # never echoed back in the payload (only product_id/risk_level).
@@ -352,13 +393,16 @@ class DataRepository:
                         match_cols.remove('warehouse_id')
                         if 'warehouse_id' in read_cols:
                             read_cols.remove('warehouse_id')
-                # risk_level domain is collected while this same file is
-                # streamed during warm-up.  The column stays in the read
+                # risk_level domain = the code-defined label set (superset) plus
+                # anything already observed while streaming the file.  A superset
+                # can never cause a wrong skip.  The column stays in the read
                 # (SKU rows echo risk_level back) - it is only un-matched.
-                risk_domain = _DERIVED_CACHE.get('stockout_risk_levels')
-                if risk_domain is not None and 'risk_level' in match_cols:
-                    if not any(q in str(level).lower() for level in risk_domain):
-                        match_cols.remove('risk_level')
+                risk_domain = {str(level).lower() for level in _STOCKOUT_RISK_DOMAIN}
+                observed_levels = _DERIVED_CACHE.get('stockout_risk_levels')
+                if observed_levels:
+                    risk_domain |= {str(level).lower() for level in observed_levels}
+                if 'risk_level' in match_cols and not any(q in level for level in risk_domain):
+                    match_cols.remove('risk_level')
                 if not match_cols:
                     # Nothing in this file can match the query -> skip the scan.
                     continue
