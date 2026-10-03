@@ -21,6 +21,18 @@ app.include_router(reports.router)
 app.include_router(dataset_analyzer_router)
 
 
+def _rss_mb() -> float:
+    try:
+        with open('/proc/self/statm') as fh:
+            pages = int(fh.read().split()[1])
+        return round(pages * os.sysconf('SC_PAGE_SIZE') / 1048576, 1)
+    except Exception:
+        return 0.0
+
+
+_WARM_STATE = {'done': False}
+
+
 @app.get('/api/health')
 def health():
     return {
@@ -29,18 +41,42 @@ def health():
         'phases': '0-17',
         'api_version': '1.2.0',
         'components': ['api', 'realtime', 'mlops', 'dataset_analyzer'],
+        'rss_mb': _rss_mb(),
+        'warm': _WARM_STATE['done'],
     }
+
+
+def _warm_geospatial() -> None:
+    """Pre-build every geospatial layer with the exact limit the map requests.
+    The map fires ~10 layers at once; without this the burst of uncached builds
+    queued behind the proxy timeout and spiked memory to the 512 MiB limit."""
+    try:
+        for net in ('brazil', 'india'):
+            geospatial.warehouses(network=net, limit=500, offset=0)
+            geospatial.transfers(network=net, limit=5000, offset=0)
+            geospatial.routes(network=net)
+        geospatial.sellers(limit=5000, offset=0)
+        geospatial.shipping_lanes_endpoint(limit=2000, offset=0)
+        geospatial.demand(limit=5000, offset=0)
+        geospatial.inventory(limit=5000, offset=0)
+        geospatial.orders(limit=5000, offset=0)
+        geospatial.customers(limit=10000, offset=0)
+        geospatial.delivery(limit=5000, offset=0)
+        geospatial.orders(limit=10000, offset=0)
+        geospatial.delivery(limit=10000, offset=0)
+    except Exception:
+        pass
 
 
 def _warm_expensive_routes() -> None:
     """Compute the derived aggregates once, right after boot, so the first user
     request is not the one paying the multi-second streaming pass."""
-    try:
-        dashboard._warm_caches()
-        insights.insights()
-        reports.reports()
-    except Exception:
-        pass
+    for step in (dashboard._warm_caches, insights.insights, reports.reports, _warm_geospatial):
+        try:
+            step()
+        except Exception:
+            pass
+    _WARM_STATE['done'] = True
 
 
 @app.on_event('startup')

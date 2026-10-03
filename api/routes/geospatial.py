@@ -34,8 +34,12 @@ _BUILD_SLOTS = threading.Semaphore(2)
 def records(df, limit, offset):
     total = len(df)
     df = df.iloc[offset : offset + limit]
+    return _payload(df, total, limit, offset)
+
+
+def _payload(part, total, limit, offset):
     return {
-        "items": df.where(df.notna(), None).to_dict("records"),
+        "items": part.where(part.notna(), None).to_dict("records"),
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -58,8 +62,18 @@ def _cached_records(key: str, builder, limit: int, offset: int) -> dict:
                 return hit
         with _BUILD_SLOTS:
             df = builder()
-        payload = records(df, limit, offset)
-        del df
+        # Keep only the requested slice alive: release the 100k-row build frame
+        # before the dict conversion so RSS drops while the payload is built.
+        total = len(df)
+        if offset == 0 and limit >= total:
+            part = df
+            df = None
+        else:
+            part = df.iloc[offset : offset + limit].copy()
+            df = None
+            gc.collect()
+        payload = _payload(part, total, limit, offset)
+        del part
         gc.collect()
         with _CACHE_LOCK:
             _PAYLOAD_CACHE[cache_key] = payload
