@@ -21,11 +21,14 @@ router = APIRouter(prefix="/api/geospatial", tags=["geospatial"])
 
 # The map fires every layer at once; each builder materialises a 100k-row frame
 # (up to 56 MB), so concurrent first loads peaked near the 512 MiB Render limit
-# and returned 502s.  Two guards fix it: only two builders may run at a time
-# (bounds the transient peak to ~112 MB) and the finished response payload is
-# cached (small - just the requested rows) so repeats never rebuild anything.
+# and returned 502s.  Three guards fix it: only two builders may run at a time
+# (bounds the transient peak to ~112 MB), the finished response payload is
+# cached (small - just the requested rows) so repeats never rebuild anything,
+# and the payload cache is capped so it cannot itself grow into the limit:
+# entries are 5-20 MiB each, so 64 of them held hundreds of MiB and the worker
+# was OOM-killed during boot.  Evicted entries simply rebuild on next request.
 _PAYLOAD_CACHE: OrderedDict[tuple, dict] = OrderedDict()
-_CACHE_LIMIT = 64
+_CACHE_LIMIT = 16
 _CACHE_LOCK = threading.Lock()
 _BUILD_LOCKS: dict[tuple, threading.Lock] = {}
 _BUILD_SLOTS = threading.Semaphore(2)

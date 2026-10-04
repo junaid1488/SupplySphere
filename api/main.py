@@ -32,6 +32,7 @@ def _rss_mb() -> float:
 
 
 _WARM_STATE = {'done': False}
+_WARM_BUDGET_SECONDS = 60.0
 
 
 @app.get('/api/health')
@@ -55,37 +56,55 @@ def health_head() -> Response:
     return Response(status_code=200, media_type='application/json')
 
 
-def _warm_geospatial() -> None:
-    """Pre-build every geospatial layer with the exact limit the map requests.
-    The map fires ~10 layers at once; without this the burst of uncached builds
-    queued behind the proxy timeout and spiked memory to the 512 MiB limit."""
-    try:
-        for net in ('brazil', 'india'):
-            geospatial.warehouses(network=net, limit=500, offset=0)
-            geospatial.transfers(network=net, limit=5000, offset=0)
-            geospatial.routes(network=net)
-        geospatial.sellers(limit=5000, offset=0)
-        geospatial.shipping_lanes_endpoint(limit=2000, offset=0)
-        geospatial.demand(limit=5000, offset=0)
-        geospatial.inventory(limit=5000, offset=0)
-        geospatial.orders(limit=5000, offset=0)
-        geospatial.customers(limit=10000, offset=0)
-        geospatial.delivery(limit=5000, offset=0)
-        geospatial.orders(limit=10000, offset=0)
-        geospatial.delivery(limit=10000, offset=0)
-    except Exception:
-        pass
+def _warm_geospatial(deadline: float) -> None:
+    """Build only the layers the first map view asks for, and stop as soon as
+    the boot budget runs out.
 
-
-def _warm_expensive_routes() -> None:
-    """Compute the derived aggregates once, right after boot, so the first user
-    request is not the one paying the multi-second streaming pass."""
-    for step in (dashboard._warm_caches, insights.insights, reports.reports, _warm_geospatial):
+    Warming every layer at every limit the UI can request kept a dozen
+    5-20 MiB payloads plus their 100k-row build frames alive at boot, pushed
+    RSS past the 512 MiB limit and the worker was OOM-killed - that is what the
+    site saw as 502s.  The heavier layers (orders/customers/delivery/demand/
+    inventory) now build lazily on first request, two at a time
+    (geospatial._BUILD_SLOTS), which is what their own payload cache is for."""
+    steps = []
+    for net in ('brazil', 'india'):
+        steps.append(lambda net=net: geospatial.warehouses(network=net, limit=500, offset=0))
+        steps.append(lambda net=net: geospatial.routes(network=net))
+        steps.append(lambda net=net: geospatial.transfers(network=net, limit=5000, offset=0))
+    steps.append(lambda: geospatial.sellers(limit=5000, offset=0))
+    steps.append(lambda: geospatial.shipping_lanes_endpoint(limit=2000, offset=0))
+    for step in steps:
+        if time.monotonic() >= deadline:
+            return
         try:
             step()
         except Exception:
             pass
-    _WARM_STATE['done'] = True
+
+
+def _warm_expensive_routes() -> None:
+    """Compute the derived aggregates once, right after boot, so the first user
+    request is not the one paying the multi-second streaming pass.
+
+    The warm-up is bounded by _WARM_BUDGET_SECONDS and always reports warm
+    afterwards: an unbounded warm-up held hundreds of MiB, OOM-killed the
+    512 MiB worker and turned every request into a 502."""
+    deadline = time.monotonic() + _WARM_BUDGET_SECONDS
+    try:
+        for step in (
+            dashboard._warm_caches,
+            lambda: _warm_geospatial(deadline),
+            insights.insights,
+            reports.reports,
+        ):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                step()
+            except Exception:
+                pass
+    finally:
+        _WARM_STATE['done'] = True
 
 
 def _periodic_session_cleanup() -> None:
