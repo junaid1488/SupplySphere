@@ -115,13 +115,40 @@ def test_matches_whole_frame_algorithm(tmp_path, monkeypatch, snapshots, chunksi
     assert actual == pytest.approx(expected, rel=0, abs=0)
 
 
-def test_sparse_cost_coverage_returns_none(tmp_path, monkeypatch):
+def _sparse_estimate(inventory: pd.DataFrame, orders: pd.DataFrame) -> float:
+    """Contract of the streamed implementation when cost coverage is low.
+
+    The original whole-frame algorithm returned ``None`` below 95 % coverage,
+    which blanked the KPI: ``purchase_orders.csv`` prices only 497 of 32 951
+    catalogued products.  The streamed version instead values priced rows at
+    their real PO cost and unpriced rows at the mean PO unit cost.
+    """
+    latest = inventory["snapshot_date"].max()
+    latest_rows = inventory[inventory["snapshot_date"].eq(latest)]
+    costs = (
+        orders.dropna(subset=["product_id", "unit_cost"])
+        .groupby("product_id")["unit_cost"]
+        .mean()
+    )
+    mapped = latest_rows["product_id"].map(costs).astype(float)
+    valid = mapped.notna()
+    total = float((latest_rows.loc[valid, "on_hand"] * mapped[valid]).sum())
+    avg_unit_cost = float(costs.mean()) if len(costs) else 0.0
+    return total + (len(latest_rows) - int(valid.sum())) * avg_unit_cost
+
+
+def test_sparse_cost_coverage_falls_back_to_mean_unit_cost(tmp_path, monkeypatch):
     inventory, orders = _frames(snapshots=2)
     orders = orders.iloc[:5]
     _write(tmp_path, inventory, orders)
 
+    # The pre-streaming algorithm refuses to value the KPI below 95% coverage.
     assert _whole_frame_inventory_value(tmp_path) is None
-    assert _run(tmp_path, monkeypatch) is None
+
+    # The streamed implementation keeps the KPI alive instead of blanking it.
+    expected = _sparse_estimate(inventory, orders)
+    assert expected > 0
+    assert _run(tmp_path, monkeypatch) == pytest.approx(expected, rel=0, abs=0)
 
 
 def test_missing_file_returns_none(tmp_path, monkeypatch):

@@ -168,7 +168,7 @@ def _compute_inventory_value():
                 continue
             matched = chunk.loc[mask]
             matched_rows += len(matched)
-            unit_costs = matched["product_id"].map(costs)
+            unit_costs = matched["product_id"].map(costs).astype(float)
             valid = unit_costs.notna()
             costed_rows += int(valid.sum())
             total_value += float((matched.loc[valid, "on_hand"] * unit_costs[valid]).sum())
