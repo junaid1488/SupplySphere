@@ -1,7 +1,7 @@
 import os
 import threading
 import time
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from configs.settings import settings
 from api.routes import dashboard, operations, geospatial, tracking, realtime, mlops, insights, reports
@@ -45,6 +45,14 @@ def health():
         'rss_mb': _rss_mb(),
         'warm': _WARM_STATE['done'],
     }
+
+
+@app.head('/api/health')
+def health_head() -> Response:
+    """UptimeRobot probes with HEAD; FastAPI registers GET-only routes, so HEAD
+    was answering 405 Method Not Allowed and the monitor reported DOWN.
+    Same 200 status as GET, empty body, no change to the GET payload."""
+    return Response(status_code=200, media_type='application/json')
 
 
 def _warm_geospatial() -> None:
