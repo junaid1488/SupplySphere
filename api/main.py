@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from configs.settings import settings
@@ -79,6 +80,18 @@ def _warm_expensive_routes() -> None:
     _WARM_STATE['done'] = True
 
 
+def _periodic_session_cleanup() -> None:
+    """Expired analyzer sessions keep their cached reports in RAM; sweep every
+    10 minutes so the 512 MiB worker cannot drift into an OOM 502."""
+    while True:
+        time.sleep(600)
+        try:
+            dataset_analyzer_router._manager.cleanup_expired()
+        except Exception:
+            pass
+
+
 @app.on_event('startup')
 def _schedule_warmup() -> None:
     threading.Thread(target=_warm_expensive_routes, daemon=True).start()
+    threading.Thread(target=_periodic_session_cleanup, daemon=True).start()

@@ -86,6 +86,33 @@ class SessionManager:
                 self._profile_locks[dataset_id] = Lock()
             return self._profile_locks[dataset_id]
 
+    def _cached_report(self, dataset_id: str, key: str) -> Any | None:
+        cache = self._computation_cache.get(dataset_id)
+        if cache and key in cache:
+            return cache[key]
+        return None
+
+    def _store_report(self, dataset_id: str, key: str, value: Any) -> None:
+        self._computation_cache.setdefault(dataset_id, {})[key] = value
+
+    _READER_CACHE_LIMIT = 32
+
+    def _reader_cached(self, dataset_id: str, key: tuple, compute):
+        """Memoize reader outputs (preview/sample/columns/row-count/sheets).
+        Excel files re-parse the whole workbook on every call, so repeats cost
+        seconds each without this."""
+        cache = self._computation_cache.setdefault(dataset_id, {})
+        memo_key = "reader:" + repr(key)
+        if memo_key in cache:
+            return cache[memo_key]
+        value = compute()
+        reader_keys = [k for k in cache if k.startswith("reader:")]
+        while len(reader_keys) >= self._READER_CACHE_LIMIT:
+            cache.pop(reader_keys.pop(0), None)
+        cache[memo_key] = value
+        return value
+
+
     def create_session(
         self,
         original_filename: str,
@@ -155,7 +182,17 @@ class SessionManager:
         return self.storage.list_sessions()
 
     def cleanup_expired(self) -> int:
-        return self.storage.cleanup_expired()
+        removed = self.storage.cleanup_expired()
+        for dataset_id in list(self._computation_cache):
+            try:
+                session = self.storage.get_session(dataset_id)
+            except PathSafetyError:
+                session = None
+            if session is None or datetime.utcnow() > session.metadata.expires_at:
+                self._computation_cache.pop(dataset_id, None)
+                with self._profile_locks_guard:
+                    self._profile_locks.pop(dataset_id, None)
+        return removed
 
     def get_storage_path(self, dataset_id: str) -> Path:
         session = self.get_session(dataset_id)
@@ -171,6 +208,10 @@ class SessionManager:
         n_rows: int = 50,
         columns: list[str] | None = None,
     ) -> dict[str, Any]:
+        key = ("preview", n_rows, tuple(columns or ()))
+        return self._reader_cached(dataset_id, key, lambda: self._preview_dataset(dataset_id, n_rows, columns))
+
+    def _preview_dataset(self, dataset_id: str, n_rows: int, columns: list[str] | None) -> dict[str, Any]:
         try:
             reader = self.get_reader(dataset_id)
             return reader.get_preview(n_rows=n_rows, columns=columns)
@@ -184,6 +225,18 @@ class SessionManager:
         columns: list[str] | None = None,
         random_state: int | None = 42,
     ) -> dict[str, Any]:
+        key = ("sample", n_rows, tuple(columns or ()), random_state)
+        return self._reader_cached(
+            dataset_id, key, lambda: self._sample_dataset(dataset_id, n_rows, columns, random_state)
+        )
+
+    def _sample_dataset(
+        self,
+        dataset_id: str,
+        n_rows: int,
+        columns: list[str] | None,
+        random_state: int | None,
+    ) -> dict[str, Any]:
         try:
             reader = self.get_reader(dataset_id)
             return reader.get_sample(n_rows=n_rows, columns=columns, random_state=random_state)
@@ -191,6 +244,9 @@ class SessionManager:
             raise ReaderSessionError(f"Sampling failed: {e}") from e
 
     def list_sheets(self, dataset_id: str) -> list[str]:
+        return self._reader_cached(dataset_id, ("sheets",), lambda: self._list_sheets(dataset_id))
+
+    def _list_sheets(self, dataset_id: str) -> list[str]:
         try:
             reader = self.get_reader(dataset_id)
             return reader.get_sheet_names()
@@ -203,6 +259,18 @@ class SessionManager:
         sheet_name: str | int = 0,
         n_rows: int | None = None,
         columns: list[str] | None = None,
+    ) -> dict[str, Any]:
+        key = ("sheet", sheet_name, n_rows, tuple(columns or ()))
+        return self._reader_cached(
+            dataset_id, key, lambda: self._read_sheet(dataset_id, sheet_name, n_rows, columns)
+        )
+
+    def _read_sheet(
+        self,
+        dataset_id: str,
+        sheet_name: str | int,
+        n_rows: int | None,
+        columns: list[str] | None,
     ) -> dict[str, Any]:
         try:
             reader = self.get_reader(dataset_id)
@@ -224,6 +292,9 @@ class SessionManager:
             raise ReaderSessionError(f"Chunked read failed: {e}") from e
 
     def get_column_info(self, dataset_id: str) -> dict[str, Any]:
+        return self._reader_cached(dataset_id, ("columns",), lambda: self._get_column_info(dataset_id))
+
+    def _get_column_info(self, dataset_id: str) -> dict[str, Any]:
         try:
             reader = self.get_reader(dataset_id)
             return reader.get_column_info()
@@ -231,6 +302,9 @@ class SessionManager:
             raise ReaderSessionError(f"Get column info failed: {e}") from e
 
     def get_row_count(self, dataset_id: str) -> int:
+        return self._reader_cached(dataset_id, ("row_count",), lambda: self._get_row_count(dataset_id))
+
+    def _get_row_count(self, dataset_id: str) -> int:
         try:
             reader = self.get_reader(dataset_id)
             return reader.get_row_count()
@@ -309,6 +383,9 @@ class SessionManager:
             raise ProfilingError(f"Capability detection failed: {e}") from e
 
     def compute_kpis(self, dataset_id: str) -> KPIReport:
+        cached = self._cached_report(dataset_id, "kpis")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -319,13 +396,18 @@ class SessionManager:
                 capability_detection,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "kpis", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:
             raise KPIError(f"KPI computation failed: {e}") from e
 
     def compute_analytics(self, dataset_id: str) -> AnalyticsReport:
+        cached = self._cached_report(dataset_id, "analytics")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -334,13 +416,18 @@ class SessionManager:
                 schema_intelligence,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "analytics", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:
             raise AnalyticsError(f"Analytics computation failed: {e}") from e
 
     def compute_trends(self, dataset_id: str) -> TrendReport:
+        cached = self._cached_report(dataset_id, "trends")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -349,13 +436,18 @@ class SessionManager:
                 schema_intelligence,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "trends", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:
             raise TrendError(f"Trend computation failed: {e}") from e
 
     def compute_queries(self, dataset_id: str) -> QueryAnalysisReport:
+        cached = self._cached_report(dataset_id, "queries")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -364,13 +456,18 @@ class SessionManager:
                 schema_intelligence,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "queries", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:
             raise ProfilingError(f"Query computation failed: {e}") from e
 
     def compute_insights(self, dataset_id: str) -> InsightsReport:
+        cached = self._cached_report(dataset_id, "insights")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -381,13 +478,18 @@ class SessionManager:
                 capability_detection,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "insights", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:
             raise ProfilingError(f"Insights computation failed: {e}") from e
 
     def compute_report(self, dataset_id: str) -> ComprehensiveReport:
+        cached = self._cached_report(dataset_id, "report")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -398,13 +500,18 @@ class SessionManager:
                 capability_detection,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "report", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:
             raise ProfilingError(f"Report computation failed: {e}") from e
 
     def compute_domain(self, dataset_id: str) -> DomainAnalysisReport:
+        cached = self._cached_report(dataset_id, "domain")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -415,13 +522,18 @@ class SessionManager:
                 capability_detection,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "domain", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:
             raise DomainError(f"Domain computation failed: {e}") from e
 
     def compute_geospatial(self, dataset_id: str) -> GeospatialAnalysisReport:
+        cached = self._cached_report(dataset_id, "geospatial")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -430,13 +542,18 @@ class SessionManager:
                 schema_intelligence,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "geospatial", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:
             raise GeospatialError(f"Geospatial computation failed: {e}") from e
 
     def compute_routes(self, dataset_id: str) -> RouteAnalysisReport:
+        cached = self._cached_report(dataset_id, "routes")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -445,13 +562,18 @@ class SessionManager:
                 schema_intelligence,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "routes", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:
             raise RouteError(f"Route computation failed: {e}") from e
 
     def compute_anomalies(self, dataset_id: str) -> AnomalyDetectionReport:
+        cached = self._cached_report(dataset_id, "anomalies")
+        if cached is not None:
+            return cached
         try:
             profile = self.profile_dataset(dataset_id)
             schema_intelligence = self.analyze_schema(dataset_id)
@@ -460,7 +582,9 @@ class SessionManager:
                 schema_intelligence,
                 reader_provider=lambda: self.get_reader(dataset_id),
             )
-            return engine.compute_all()
+            report = engine.compute_all()
+            self._store_report(dataset_id, "anomalies", report)
+            return report
         except ProfilingError:
             raise
         except Exception as e:

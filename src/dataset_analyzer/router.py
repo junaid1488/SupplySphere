@@ -48,6 +48,27 @@ def _run_profiling(dataset_id: str) -> None:
             _manager.update_status(dataset_id, DatasetStatus.ERROR, "Profiling failed")
         except Exception:
             pass
+        return
+
+    # Sections (kpis/analytics/report/...) cost 20-50 s each on a big file.
+    # Compute them once here, right after profiling, so the first tab click
+    # hits the cache instead of paying the full pass.
+    for compute in (
+        _manager.compute_queries,
+        _manager.compute_kpis,
+        _manager.compute_analytics,
+        _manager.compute_trends,
+        _manager.compute_insights,
+        _manager.compute_domain,
+        _manager.compute_geospatial,
+        _manager.compute_routes,
+        _manager.compute_anomalies,
+        _manager.compute_report,
+    ):
+        try:
+            compute(dataset_id)
+        except Exception:
+            pass
 
 
 @router.post("/sessions", status_code=status.HTTP_201_CREATED, response_model=None)
