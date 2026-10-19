@@ -14,8 +14,6 @@ PostgreSQL-backed supply chain intelligence platform with:
 - **Phases 11–14:** Geospatial intelligence, FastAPI APIs, React control-tower UI, global search, shipment tracking
 - **Phases 15–17:** Real-time simulation, MLOps & monitoring, production hardening
 
-### 2. Dataset Analyzer (Phases 18–20)
-
 
 
 
