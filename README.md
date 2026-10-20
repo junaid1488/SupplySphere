@@ -15,11 +15,6 @@ PostgreSQL-backed supply chain intelligence platform with:
 - **Phases 11–14:** Geospatial intelligence, FastAPI APIs, React control-tower UI, global search, shipment tracking
 - **Phases 15–17:** Real-time simulation, MLOps & monitoring, production hardening
 
-### 2. Dataset Analyzer (Phases 18–20)
-
-Schema-aware, generic dataset analysis system:
-- Secure upload of CSV/XLSX files
-
 
 **Dataset Analyzer is NOT Olist.** It is a separate, generic system that analyzes any uploaded dataset. It does not assume Olist data, Brazilian geography, or fixed product/supplier/warehouse names.
 
