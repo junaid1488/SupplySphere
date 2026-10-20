@@ -21,8 +21,6 @@ Schema-aware, generic dataset analysis system:
 - Secure upload of CSV/XLSX files
 - Deterministic profiling and schema intelligence
 - Dynamic capability detection based on uploaded data
-- KPI, analytics, trends, domain, geospatial, route, anomaly analysis
-- Ask Your Dataset (deterministic query engine)
 
 
 
