@@ -23,8 +23,6 @@ Schema-aware, generic dataset analysis system:
 - Dynamic capability detection based on uploaded data
 - KPI, analytics, trends, domain, geospatial, route, anomaly analysis
 - Ask Your Dataset (deterministic query engine)
-- Evidence-based insights and comprehensive reports
-- Temporary filesystem storage with TTL expiration
 
 
 **Dataset Analyzer is NOT Olist.** It is a separate, generic system that analyzes any uploaded dataset. It does not assume Olist data, Brazilian geography, or fixed product/supplier/warehouse names.
