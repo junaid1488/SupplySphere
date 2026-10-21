@@ -17,8 +17,7 @@ PostgreSQL-backed supply chain intelligence platform with:
 
 ### 2. Dataset Analyzer (Phases 18–20)
 
-Schema-aware, generic dataset analysis system:
-- Secure upload of CSV/XLSX files
+
 
 **Dataset Analyzer is NOT Olist.** It is a separate, generic system that analyzes any uploaded dataset. It does not assume Olist data, Brazilian geography, or fixed product/supplier/warehouse names.
 
