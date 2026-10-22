@@ -19,8 +19,6 @@ PostgreSQL-backed supply chain intelligence platform with:
 
 Schema-aware, generic dataset analysis system:
 - Secure upload of CSV/XLSX files
-- Deterministic profiling and schema intelligence
-- Dynamic capability detection based on uploaded data
 
 
 
