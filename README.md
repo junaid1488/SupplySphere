@@ -10,8 +10,7 @@ SupplySphere contains two independent systems:
 ### 1. Olist Control Tower (Phases 0–17)
 
 PostgreSQL-backed supply chain intelligence platform with:
-- **Phases 0–5:** Data ingestion, PostgreSQL schemas, analytics, synthetic operational layer, demand forecasting
-- **Phases 6–10:** Stockout prediction, supplier intelligence, warehouse optimization, delivery risk, procurement optimizati
+
 
 
 **Dataset Analyzer is NOT Olist.** It is a separate, generic system that analyzes any uploaded dataset. It does not assume Olist data, Brazilian geography, or fixed product/supplier/warehouse names.
