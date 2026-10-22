@@ -6,26 +6,6 @@ Schema-Aware Dataset Analyzer + Ask Your Dataset, integrated alongside the Olist
 
 SupplySphere contains two independent systems:
 
-
-
-### 1. Olist Control Tower (Phases 0–17)
-
-PostgreSQL-backed supply chain intelligence platform with:
-- **Phases 0–5:** Data ingestion, PostgreSQL schemas, analytics, synthetic operational layer, demand forecasting
-- **Phases 6–10:** Stockout prediction, supplier intelligence, warehouse optimization, delivery risk, procurement optimization
-- **Phases 11–14:** Geospatial intelligence, FastAPI APIs, React control-tower UI, global search, shipment tracking
-- **Phases 15–17:** Real-time simulation, MLOps & monitoring, production hardening
-
-### 2. Dataset Analyzer (Phases 18–20)
-
-Schema-aware, generic dataset analysis system:
-- Secure upload of CSV/XLSX files
-- Deterministic profiling and schema intelligence
-- Dynamic capability detection based on uploaded data
-- KPI, analytics, trends, domain, geospatial, route, anomaly analysis
-- Ask Your Dataset (deterministic query engine)
-- Evidence-based insights and comprehensive reports
-- Temporary filesystem storage with TTL expiration
 ### 1. Olist Control Tower (Phases 0–17)
 
 PostgreSQL-backed supply chain intelligence platform with:
