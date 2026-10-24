@@ -22,8 +22,7 @@ Schema-aware, generic dataset analysis system:
 - Dynamic capability detection based on uploaded data
 - KPI, analytics, trends, domain, geospatial, route, anomaly analysis
 - Ask Your Dataset (deterministic query engine)
-- Evidence-based insights and comprehensive reports
-- Temporary filesystem storage with TTL expiration
+
 
 
   
