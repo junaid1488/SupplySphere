@@ -1,5 +1,5 @@
 # SupplySphere — Supply Chain Intelligence Platform
-
+frontend 
 Schema-Aware Dataset Analyzer + Ask Your Dataset, integrated alongside the Olist Supply Chain Control Tower.
 
 ## Architecture Overview
