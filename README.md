@@ -12,9 +12,6 @@ PostgreSQL-backed supply chain intelligence platform with:
 - **Phases 0–5:** Data ingestion, PostgreSQL schemas, analytics, synthetic operational layer, demand forecasting
 - **Phases 6–10:** Stockout prediction, supplier intelligence, warehouse optimization, delivery risk, procurement optimization
 - **Phases 11–14:** Geospatial intelligence, FastAPI APIs, React control-tower UI, global search, shipment tracking
-- **Phases 15–17:** Real-time simulation, MLOps & monitoring, production hardening
-
-### 2. Dataset Analyzer (Phases 18–20)
 
 
   
